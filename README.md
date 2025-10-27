@@ -4,6 +4,10 @@ A Windows-only GUI utility that keeps selected drives awake at safe, user-define
 
 Please note that, ironically, the most out of date aspects of this system are the readme and version history. This will be rectified in the next few days, but running main.py or one of the .bat files (the debug version is for developers) after installing the necessary packages from requirements.txt to your python installation should get you started and much of the system is self-explanatory or includes extensive tooltips and other assistance.  You may need to manually enable your drives and adjust its interval time to between 6-15 seconds (for HDDs) or 30-40 seconds (for SSDs), but these settings will persist within your config file indefinitely.  New drives connected to the system should be automatically detected while disconnected drives are disabled (though not fully removed until they not been connected for 15d (another user-adjustable setting.)
 
+
+This is my first fully functional application out of the gate, despite being at least twice as long as any other to this point, thanks to a Test-Driven Development approach and strict 'waterfall' development philosophy. 
+
+
 ## Key Features
 
 ### Safety First
