@@ -2,6 +2,8 @@
 
 A Windows-only GUI utility that keeps selected drives awake at safe, user-defined intervals using tiny read/write operations and strict jitter to avoid contention. Built for safety, clarity, and low overhead.
 
+Please note that, ironically, the most out of date aspects of this system are the readme and version history. This will be rectified in the next few days, but running main.py or one of the .bat files (the debug version is for developers) after installing the necessary packages from requirements.txt to your python installation should get you started and much of the system is self-explanatory or includes extensive tooltips and other assistance.  You may need to manually enable your drives and adjust its interval time to between 6-15 seconds (for HDDs) or 30-40 seconds (for SSDs), but these settings will persist within your config file indefinitely.  New drives connected to the system should be automatically detected while disconnected drives are disabled (though not fully removed until they not been connected for 15d (another user-adjustable setting.)
+
 ## Key Features
 
 ### Safety First
@@ -206,7 +208,8 @@ ruff check .
 mypy .
 ```
 
-## Recent Updates (2025-10-11)
+## Updates (2025-10-17)
+I would be remiss in failing to mention the ages-old application that inspired the basis for this system - even if it did once manage to corrupt one of my drives! I believe the name was something like Drive Killer or something similar, if even still extant somewhere.  I am certain the full name will return to me at some point so I can properly credit the fundamental concept of maintaining HDDs in a responsive state by preventing their auto-sleep routines.
 
 ### Critical Bug Fixes (PLAN 4)
 - **Fixed scheduler loop crashes**: Resolved multiple critical crashes including undefined variable 'letter' in `_plan_operations_cached` that caused scheduler failures
