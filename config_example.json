@@ -1,0 +1,51 @@
+{
+  "version": 4,
+  "install_id": "00000000-0000-0000-0000-000000000000",
+  "portable": false,
+  "autostart": false,
+  "autostart_method": "scheduler",
+  "treat_unknown_as_ssd": true,
+  "default_interval_sec": 10,
+  "interval_min_sec": 3,
+  "jitter_sec": 3,
+  "hdd_max_gap_sec": 45,
+  "deadline_margin_sec": 0.3,
+  "pause_on_battery": true,
+  "idle_pause_min": 0,
+  "policy_precedence": [
+    "global_pause",
+    "battery",
+    "idle",
+    "per_drive_disable"
+  ],
+  "fsync": true,
+  "max_flush_ms": 150,
+  "lock_retry_ms": 750,
+  "error_quarantine_after": 5,
+  "error_quarantine_sec": 60,
+  "log_max_kb": 150,
+  "log_history_count": 5,
+  "log_ndjson": true,
+  "cli_countdown_interval_sec": 15,
+  "gui_update_interval_ms": 500,
+  "gui_update_interval_editing_ms": 1000,
+  "hide_console_window": true,
+  "disable_hotkeys": true,
+  "suppress_quit_confirm": false,
+  "suppress_ssd_warnings": {},
+  "per_drive": {
+    "F:": {
+      "enabled": true,
+      "interval": 8,
+      "type": "HDD",
+      "ping_dir": null
+    },
+    "G:": {
+      "enabled": true,
+      "interval": 30,
+      "type": "SSD",
+      "ping_dir": null
+    }
+  }
+}
+
