@@ -1,242 +1,342 @@
 # Drive Revenant - System Version Log
 
-> System version numbers below are **project‑level** milestones (not the per‑module file headers). Each version change covers (roughly) 10 minor changes or bugfixes done in a given session on a given day.
+> System version numbers are **project-level** milestones (not per-module file headers). Each version represents a coherent set of changes focused on keeping drives active and preventing sleep mode.
 
-## v0.1.0 - v0.1.8 · Foundations · 2025-10-02
-- First runnable baseline with basic config management and path layout for `%APPDATA%/DriveRevenant` and portable mode directories
-- Initial scheduler loop with fixed cadence and early jitter spacing (~0.5s any‑any, ~1.0s write‑write)
-- I/O groundwork: safe write with temporary file + atomic move; basic lock retry/backoff
-- Device probing and volume information collection with early WMI/PowerShell helpers
-- Error taxonomy scaffolded (OK / SKIP_LOCKED / ERROR) and human logs created
-- Test scaffolding: basic unit tests and real‑drive smoke tests
+## Core Purpose
 
-## v0.2.0 - v0.2.4 · Data Integrity and Logging · 2025-10-02
-- Basic functionality tests for core scheduling, I/O safety, and config load/save
-- Real‑drive smoke tests with external media and import‑graph verification
-- Minimal CI runner scripts for local Windows runs (e.g., `test.bat`, `run.bat`)
-- NDJSON schema sanity checks and log rotation assertions
-- Failure‑mode assertions for `SKIP_LOCKED`, timeouts, and partial flush
-- Scaffold for pytest fixtures and environment bootstrap
+Drive Revenant prevents drives from entering sleep mode by performing tiny read/write operations at safe intervals. This eliminates data access latency that occurs when drives must wake from sleep states, ensuring instant file access.
 
-## v0.3.0 - v0.3.7 · Pause and Policy · 2025-10-03
-- Introduced `DriveStatus` (incl. `PAUSED`) and `PolicyState` to unify GUI/core semantics
-- Expanded operation enums and status snapshot schema for stable GUI/log consumption
-- Clarified policy precedence (global pause → battery → idle → per‑drive disable)
-- Added docstrings and comments to types for maintainability
-- Built PySide6 interface: drive table with in‑cell editing and color/status indicators
-- Context menu actions for per‑drive pause/resume and details
+## v3.3.2 · Countdown & Interval Fixes (2025-10-25)
 
-## v0.4.0 - v0.4.4 · Scheduler and Timing · 2025-10-03
-- System tray integration for background operation; notifications wired
-- Settings dialog covering key configuration values with validation
-- Real‑time “Next in” countdown column and basic keyboard navigation
-- Hash‑based change detection so GUI updates only on state changes (reduced churn)
-- Global & per‑drive pause/resume wired into policy engine (battery/idle/global)
-- Quarantine & retry system for transient I/O failures with bounded backoff
+### Exponential Quarantine System
+- **Smart backoff**: Implements exponential quarantine backoff (30s × 2^n, up to 2^11 ≈ 21 days) for drives with repeated failures
+- **Quarantine counter**: Tracks quarantine attempts (0-11) per drive, resets on successful operation
+- **Permanent removal**: Drives at max quarantine (11) that remain stale for extended periods are permanently removed
+- **Status clarity**: Quarantine status clearly indicates "not currently accessible" rather than "permanently gone"
 
-## v0.5.0 - v0.5.7 · Scheduler and Timing · 2025-10-03
-- Optimized status emission path; immediate feedback after control actions
-- Better error recovery and clearer logging around device disappearance
-- Introduced `JitterPlanner` with a 500 ms grid and deterministic BLAKE2s tie‑breaks
-- Enforced spacing rules (0.5 s any‑any, 1.0 s write‑write) and HDD‑guard earlier‑only offsets
-- Multi‑drive collision packing (writes first, reads next) with overflow handling
-- Half‑second timing indicators and tie‑break metadata in human logs
+### Countdown Display Improvements
+- **"Due now" display**: Shows "Due now" instead of "0s" or "-" when next operation is <1 second away
+- **Countdown restart fix**: Fixed issue where countdowns would stop at default interval values
+- **Planning cycle fixes**: Corrected `_plan_operations` to handle past-due operations and re-plan correctly
+- **Execution timing**: Fixed `_execute_due_operations` to properly clear `next_due_at` after execution
 
-## v0.6.0 - v0.6.6 · Scheduler and Timing · 2025-10-04
-- Error budget tracking and quarantine thresholds wired into scheduler
-- Diagnostics export flow added to the GUI; clearer status countdown behavior
-- Policy precedence clarified, with interval clamping and status indication
-- Config v3 migration with atomic save + backups, integrity verification, and repair
-- Main: single‑instance mutex, `--debug` flag, clearer startup errors/help
-- Logging: improved NDJSON schema, better rotation, and timing/metadata fields
+### Interval Override Fix
+- **HDD protection**: Increased `hdd_max_gap_sec` from 5.0s to 300.0s (5 minutes) to respect configured intervals
+- **Interval respect**: Configured intervals are no longer overridden by aggressive HDD guard logic
+- **Effective interval**: Fixed calculation to properly use configured intervals for both HDD and SSD drives
 
-## v0.7.0 - v0.7.4 · Scheduler and Timing · 2025-10-04
-- Autostart plumbing set up (Task Scheduler preferred; Registry fallback for portable)
-- Strengthened import graph and removed redundant init paths in entry flow
-- Global Pause/Resume toolbar and per‑drive context controls
-- Immediate, clearer status feedback on actions; better UX responsiveness
-- Visual polish on status indicators and table sizing/formatting
-- Minor fixes to keep rows stable during refresh
+### Full Rescan Feature
+- **Complete reset**: Added "Full Rescan (Clear All)" menu option to completely reset drive configurations
+- **Fresh scan**: Clears all existing drives and performs a complete fresh scan of available drives
+- **State reset**: Resets scheduler state, timing states, and scheduled operations for clean slate
 
-## v0.8.0 - v0.8.4 · Testing and Verification · 2025-10-04
-- README usage instructions aligned with packaging outputs; installer track stubbed (signing TBD)
-- Version metadata conventions documented for future builds
-- GitHub Actions CI workflow established for build and tests
-- Requirements normalized and reproducible installs documented
+### System Tray Fix
+- **Exit functionality**: Fixed exit from system tray menu to properly quit the application
+- **Menu action**: Changed from `self.close()` to `self.do_quit()` for proper shutdown
 
-## v0.9.0 - v0.9.7 · Scheduler and Timing · 2025-10-04
-- Single‑instance enforcement and clean shutdown verified under packaged runs
-- Local runner scripts kept for parity with CI and release prep
-- Expanded schema v3 keys documented and enforced: `defaultintervalsec`, `intervalminsec`, `jittersec`, `hddmaxgapsec`, `deadlinemarginsec`
-- Clarified policy precedence (global pause, then battery, then idle, then per‑drive disable) and surfaced policy reasons in status
-- Added `pauseonbattery` and `idlepausemin` controls with safe defaults
-- Introduced durability controls: `fsync`, bounded flush (`maxflushms`), and `lockretryms`
+### Architecture Migration
+- **Scheduler-based**: Complete migration to centralized scheduler as single source of truth
+- **Drive state**: All drive state now managed by `Scheduler` with `DriveTimingState` dataclass
+- **Removed deprecated**: Eliminated all references to old `drive_states` dictionary
+- **Method updates**: Updated `main.py` and all modules to use scheduler-based approach
 
-## v1.0.0 - v1.0.6 · Data Integrity and Logging · 2025-10-05
-- Error handling extensions: `errorquarantineafter`/`errorquarantinesec` for repeated failures
-- Toggle to `treatunknownas_ssd` to avoid unnecessary writes on ambiguous media
-- Per‑drive overrides (`enabled`, `interval`, `type`, `ping_dir`) formalized
-- NDJSON event schema stabilized (timestamp, drive, operation, outcome, latency, notes) for external analysis
-- Log rotation hardened via `logmaxkb` and `loghistorycount`; consistent timestamp formats
-- Human‑readable logs improved for triage; mapped error classes to concise messages
-
-## v1.1.0 - v1.1.6 · Scheduler and Timing · 2025-10-05
-- Added diagnostics export bundle (config snapshot, logs, NDJSON sample) from the UI
-- Sharpened log levels and retention guidance for support scenarios
-- Default autostart via Task Scheduler; resilient repair flow; naming conventions standardized
-- Registry‑based autostart fallback when running in portable mode
-- Portable mode keeps `config.json` and logs beside the executable
-- Command‑line flags: `--portable` and `--debug` documented and respected consistently
-
-## v1.2.0 - v1.2.7 · GUI and UX · 2025-10-05
-- Startup banner surfaces missing/broken autostart with a one‑click fix
-- Stable row order during refresh; header sorting disabled by default to prevent jumpy tables
-- In‑cell editing guard rails to avoid clobbering active edits
-- System tray presence/behavior normalized across sessions
-- Keyboard navigation and focus handling improved for faster edits
-- Tooltips and microcopy added in Settings to clarify effects of key options
-
-## v1.3.0 - v1.3.4 · Scheduler and Timing · 2025-10-06
-- Table column sizing tweaked for common resolutions
-- Locked in module layout (`appgui`, `appcore`, `appconfig`, `appio`, `applogging`, `apptypes`) and public interfaces; Plan 7 supersedes Plan 6
-- Scheduling is fully specified: monotonic clock, resume smoothing (`now + min(2 s, 0.5×interval)`), canonical cadence `t_nom(k)` with no drift
-- Deterministic daily tie‑break using per‑install `installid` + local date; same‑tick set packing (writes first, reads next) with NDJSON `tieepoch`, `tierank`, and `packsize` fields
-- HDD guard: effective interval cap, earlier‑only offsets with tiny late slack, and a per‑install stable phase snapped to the 0.5 s grid at enable
-- I/O semantics finalized: bounded flush via `maxflushms` (PARTIALFLUSH), `SKIPLOCKED` without shifting schedule, default target file `driverevenant` in `X:\.driverevenant\`
-
-## v1.4.0 - v1.4.6 · Scheduler and Timing · 2025-10-06
-- GUI behavior consolidated: global countdown in status bar; tooltips with last 3 results; SSD write warning persistence; autostart integrity banner; Exit to Tray/Quit All semantics; hotkey disable option; diagnostics export
-- Config v3 fields and branding migration (`KeepAlivePy` → `DriveRevenant`) made authoritative
-- New GUI performance settings: `guiupdateintervalms` (default 500) and `guiupdateintervalediting_ms` (default 1000) with UI ranges (100ms-5s normal, 200ms-10s editing)
-- StatusUpdateThread auto‑restarts when intervals change; 2× faster default refresh (500ms vs 1000ms)
-- Drive‑letter normalization across engine/GUI/tests (`"E"` vs `"E:"`) to fix sizing/lookup inconsistencies
-- Type detection simplified: NVMe→SSD; SDXC+removable→Removable; `SCSI`/`HDD` tokens→HDD; else Unknown (optionally treat as SSD)
-
-## v1.5.0 - v1.5.9 · GUI and UX · 2025-10-06
-- Unit tests updated for normalized drive‑letter convention; current file headers bumped to reflect work
-- Audited Plan/README/updates and flagged missing GUI performance settings in schema/docs
-- Documented drive‑letter standards and updated detection rules for docs
-- Captured a current file versions snapshot for cross‑checking code headers
-- Recorded user‑visible impacts: faster GUI, accurate size/type, consistent behavior
-- Outlined a Files‑to‑Update list and alignment tasks for next push
-
-## v1.6.0 - v1.6.4 · GUI and UX · 2025-10-06
-- Identified critical issues: duplicate init paths; missing PS script; version inconsistencies
-- Established success metrics and production readiness checklist
-- Cleaned emoji/special characters; standardized headings, lists, and code blocks for accessibility
-- Rewrote Quick Start with explicit Standard vs Portable flows and exact commands
-- Added guidance for comparison tables and concise feature bullets
-- Proposed stable updates.md structure: Version Overview + Detailed Changelog (+ optional Architecture & Dependencies)
-
-## v1.7.0 - v1.7.7 · Pause and Policy · 2025-10-07
-- Clarified tone and versioning conventions to separate system versions from module file headers
-- Restated Phase 1-3 completion and Phase 4-5 status with actionable checklists
-- Captured performance metrics: status updates ~<50ms; memory ~<50MB; cached scans ~<2s for 5 drives; adaptive GUI refresh (500ms normal / 1000ms editing)
-- Documented cache TTLs: drive info 30s; volume info 60s; policy state 5s; incremental status with change detection
-- Detailed error taxonomy and quarantine triggers (e.g., 3 consecutive failures → quarantine) with recovery steps
-- Security/ops: minimal privileges; registry only for autostart; no network; no data exfiltration
-
-## v1.8.0 - v1.8.7 · Scheduler and Timing · 2025-10-07
-- Reiterated remaining work: GUI automation (pytest‑qt), integration/perf validation, packaging & release notes, docs pass
-- Scheduler: execute‑then‑plan loop; enforce `next_due ≥ now + 0.5s` to end 0-2s flicker; 1s status cadence; 30s CLI "Next due" summary
-- GUI: incremental, non‑destructive table refresh; strict edit‑protection; disabled header sorting; guarded `itemChanged` connection; no redundant startup rescan
-- Config: eliminate save‑storms (single write per logical change using live in‑memory config during edits)
-- Drive scans: batch PowerShell probing per scan; short prefetch cache; remove GUI‑triggered duplicate startup scan
-- Runtime: new `hideconsolewindow` (default true) with migration; quieter startup
-
-## v1.9.0 - v1.9.8 · Pause and Policy · 2025-10-07
-- Component snapshot (for reference): Core 0.2.1, GUI 0.2.6, I/O 0.2.1, Config 0.1.9, Main 0.1.8
-- Deprecated code cleanup: Fixed remaining references to deprecated `getstatus_snapshot()` method in CoreEngine
-- Parameter order fixes: Corrected DriveSnapshot constructor calls in test files with missing `effectiveintervalsec` parameter
-- Type hint improvements: Enhanced `appconfig.py` with proper `List[str]` type hint for `policyprecedence` field
-- Naming consistency audit: Verified all variable and method names follow Python conventions across all modules
-- Cross-module integration: Confirmed all method calls use correct parameter order and named parameters where appropriate
-
-## v2.0.0 - v2.0.6 · Scheduler and Timing · 2025-10-08
-- Test suite fixes: Updated `TESTguisnapshot_mapping.py` to use correct DriveSnapshot constructor signature
-- Version updates: Bumped `appcore.py` to v1.1.1 and `appconfig.py` to v1.1.1
-- Critical bug fix: Resolved repeated AttributeError crashes in scheduler loop that were flooding logs
-- Comprehensive integration testing: Created 4 comprehensive test suites (TESTdeepintegrationarchitecture.py, TESTapplicationlifecycle.py, TESTguiintegrationcomprehensive.py, TESTsystemintegration_complete.py) with 40+ deep integration tests
-- Architectural verification: Verified all major architectural changes work correctly across the entire codebase (centralized timing, immutable snapshots, scheduler loop, GUI consumption, HDD logic, ConfigManager purity)
-- Performance validation: Confirmed new architecture maintains good performance characteristics (snapshots < 10KB, updates < 1s for 100 drives)
-
-## v2.1.0 - v2.1.9 · GUI and UX · 2025-10-08
-- Thread safety verification: Validated concurrent access safety across all architectural boundaries
-- Error handling robustness: Confirmed system handles errors gracefully while maintaining stability
-- Memory management: Verified reasonable memory usage and proper cleanup (snapshots < 100KB, GUI < 50KB)
-- Zero breaking changes: Confirmed all existing functionality preserved (49/49 tests passing across all test suites)
-- CLI monitoring improvement: Reduced CLI time remaining output interval from 30 seconds to 15 seconds for better monitoring
-- System versions group coherent user‑visible behavior and architectural steps; individual file headers (for example, `app_gui.py 0.2.x`) may advance between system releases
-
-## v2.2.0 - v2.2.6 · Scheduler and Timing · 2025-10-08
-- If additional timestamped sources are provided, they will be integrated at the appropriate point in the sequence (and may introduce intermediary system versions if warranted)
-- Fixed scheduler loop crashes: Resolved repeated `AttributeError: 'CoreEngine' object has no attribute 'getstatus_snapshot'` errors that were flooding logs
-- Fixed parameter order issues: Corrected DriveSnapshot constructor calls in test files with missing `effectiveintervalsec` parameter
-- Fixed deprecated method calls: Replaced all remaining references to deprecated `getstatussnapshot()` with `getstatus_snapshot()`
-- Enhanced type hints: Added proper `List[str]` type hint for `policyprecedence` field in `appconfig.py`
-- Naming consistency audit: Verified all variable and method names follow Python conventions across all modules
-
-## v2.3.0 - v2.3.5 · Scheduler and Timing · 2025-10-09
-- Cross-module integration: Confirmed all method calls use correct parameter order and named parameters
-- Test suite fixes: Updated `TESTguisnapshot_mapping.py` to use correct DriveSnapshot constructor signature
-- Deep integration testing: Created 4 comprehensive test suites with 40+ integration tests covering all architectural components
-- Architectural verification: Confirmed all major changes work correctly (centralized timing, immutable snapshots, scheduler loop, GUI consumption)
-- Performance validation: Verified new architecture maintains good performance (snapshots < 10KB, updates < 1s for 100 drives)
-- Thread safety: Validated concurrent access safety across all architectural boundaries
-
-## v2.4.0 - v2.4.8 · Data Integrity and Logging · 2025-10-09
-- Error handling: Confirmed system handles errors gracefully while maintaining stability
-- Memory management: Verified reasonable memory usage (snapshots < 100KB, GUI < 50KB)
-- Zero breaking changes: All existing functionality preserved (49/49 tests passing across all test suites)
-- CLI monitoring improvement: Made CLI time remaining output interval configurable (default 15 seconds, not accessible via GUI) for better monitoring flexibility
-- Fixed GUI table rendering: Corrected method name from `updatetable()` to `updatedrive_data()`
-- Fixed test suite imports: Updated AutostartManager and IOResult imports after module reorganization
-
-## v2.5.0 - v2.5.4 · Foundations · 2025-10-09
-- Fixed DriveSnapshot constructor: Updated test compatibility for GUI integration
-- Fixed ConfigManager purity: Corrected test expectations for initialization behavior
-- Improved HDD protection: Increased `hddmaxgap_sec` from 5 to 45 seconds for better HDD safety
-- Enhanced drive size display: All real drives now show correct sizes in GUI
-- Verified countdown accuracy: GUI countdown calculations working correctly for all drive states
-
-## v2.6.0 - v2.6.7 · Testing and Verification · 2025-10-10
-- Deep integration testing completed
-- Architectural verification passed
-- Performance validation complete
-- Thread safety verified
-- Drive detection working (6 real drives detected)
-
-## v2.7.0 - v2.7.7 · Scheduler and Timing · 2025-10-10
-- ConfigManager purity verified
-- Critical scheduler bug fixed
-- DriveSnapshot constructors updated
-
-## v2.8.0 - v2.8.9 · Pause and Policy · 2025-10-10
-- Parameter order consistency verified across all modules
-- Deprecated code cleanup completed
-- Memory management verified (reasonable usage across all components)
-- Error and Exit handling robustness confirmed (system handles errors and exit gracefully)
-
-## v3.0.0 - v3.0.9 · Pause and Policy · 2025-10-11
-- Reversion to v2.8 and fixes due to major errors made in v2.9
-- Standardized pause reasons: user, global, battery, idle, none
-- User intent preserved: global pause no longer overrides user-paused drives
-- Pause State Reset fixed
-- Pause All Button Toggle fixed
-- Disabled Drive Display fixed
-- CLI Random Pausing fixed
-- User-Paused Drives Reverting to Active fixed
-- Windows console QuickEdit disabled to prevent accidental runtime pause
+### Component Versions
+- app_core.py: v2.0.7
+- app_types.py: v2.0.3
+- app_gui_drive_table.py: v2.0.2
+- app_config.py: v1.1.5
 
 ## v3.1.0 · Critical Bug Fixes & Stability (2025-10-11)
-- **Scheduler loop crash fixes**: Fixed undefined variable 'letter' in `_plan_operations_cached` causing repeated scheduler failures (app_core.py v1.1.7 → v1.1.8)
-- **Parameter name mismatch**: Corrected `drive_letter` vs `letter` inconsistency in `CoreEngine.set_drive_config` that caused NameError on GUI operations (app_core.py v1.1.10 → v1.1.11)
-- **Interval change detection bug**: Fixed `old_interval` capture timing to properly detect configuration changes in `set_drive_config` (prevented timing state resets)
-- **Lambda variable capture**: Resolved NameError in GUI drive table by replacing closures with `functools.partial` for 7 signal connections (app_gui_drive_table.py v1.1.9 → v1.1.10)
-- **Config save parameter**: Fixed missing `config` parameter in `ConfigManager.save_config()` calls throughout GUI modules (app_gui_drive_table.py v1.1.6 → v1.1.7, app_gui.py v1.1.8 → v1.1.9)
-- **Robust exit mechanism**: Implemented 10-second force exit timer with `os._exit(1)` fallback for unresponsive shutdowns; increased core engine stop timeout to 2000ms; added shutdown state tracking (main.py v1.0.3 → v1.0.4)
-- **Log rotation overhaul**: Replaced Log_current.txt scheme with numbered-only rotation (Log_current1.txt through Log_current5.txt); fixed AttributeError in doRollover by using standard `_open()` method; ensured logs directory creation (app_logging.py v1.0.1 → v1.0.3)
-- **CLI countdown configuration**: Made CLI time remaining output interval configurable via `cli_countdown_interval_sec` field (default 15s); updated config schema v3 → v4 with migration (app_config.py version 3 → 4, app_core.py v1.1.6 → v1.1.7)
-- **Component versions**: app_core.py v1.1.11, app_gui.py v1.1.9, app_gui_drive_table.py v1.1.10, app_logging.py v1.0.3, app_config.py v4, main.py v1.0.4
 
-## v3.3.2 · Critical Bug Fixes & Stability (2025-10-25)
+### Scheduler Loop Crash Fixes
+- **Fixed undefined variable**: Resolved `'letter'` undefined in `_plan_operations_cached` causing repeated scheduler failures
+- **Parameter name fix**: Corrected `drive_letter` vs `letter` inconsistency in `CoreEngine.set_drive_config`
+- **Interval change detection**: Fixed `old_interval` capture timing to properly detect configuration changes
+- **Lambda variable capture**: Resolved NameError in GUI drive table using `functools.partial` for signal connections
+
+### Exit & Shutdown Improvements
+- **Robust exit mechanism**: Added 10-second force exit timer with `os._exit(1)` fallback for unresponsive shutdowns
+- **Improved graceful shutdown**: Increased core engine stop timeout from 500ms to 2000ms
+- **Shutdown state tracking**: Prevented multiple shutdown attempts with `_shutdown_in_progress` flag
+
+### Logging System Overhaul
+- **Numbered log rotation**: Changed from `Log_current.txt` to numbered scheme (`Log_current1.txt` through `Log_current5.txt`)
+- **Fixed rollover bugs**: Used standard `_open()` method to prevent AttributeError during rotation
+- **Directory creation**: Ensured logs directory is always created on initialization
+
+### Configuration & Monitoring
+- **CLI countdown configuration**: Made CLI time remaining output interval configurable via `cli_countdown_interval_sec` (default 15s)
+- **Config schema migration**: Updated config version 3 → 4 with migration logic
+
+### Component Versions
+- app_core.py: v1.1.11
+- app_gui.py: v1.1.9
+- app_gui_drive_table.py: v1.1.10
+- app_logging.py: v1.0.3
+- app_config.py: v4
+- main.py: v1.0.4
+
+## v3.0.0 · Pause and Policy (2025-10-11)
+
+### Pause System Improvements
+- **Standardized pause reasons**: user, global, battery, idle, none
+- **User intent preserved**: Global pause no longer overrides user-paused drives
+- **Pause state reset**: Fixed pause state reset on drive enable/disable
+- **Pause all button toggle**: Fixed button state to reflect actual pause status
+- **Disabled drive display**: Fixed display of disabled drives in GUI
+
+### CLI and Console Fixes
+- **CLI random pausing**: Fixed CLI randomly pausing drives
+- **User-paused drives reverting**: Fixed user-paused drives reverting to active
+- **Windows console QuickEdit**: Disabled to prevent accidental runtime pause
+
+## v2.8.0 - v2.8.9 · Pause and Policy (2025-10-10)
+
+### Consistency & Stability
+- **Parameter order consistency**: Verified across all modules
+- **Deprecated code cleanup**: Completed removal of deprecated methods
+- **Memory management**: Verified reasonable usage across all components
+- **Error and exit handling**: Confirmed robust error handling and graceful exit
+
+## v2.7.0 - v2.7.7 · Scheduler and Timing (2025-10-10)
+
+### Critical Fixes
+- **ConfigManager purity**: Verified no side effects
+- **Critical scheduler bug**: Fixed major scheduling issues
+- **DriveSnapshot constructors**: Updated for compatibility
+
+## v2.6.0 - v2.6.7 · Testing and Verification (2025-10-10)
+
+### Comprehensive Testing
+- **Deep integration testing**: Completed comprehensive test coverage
+- **Architectural verification**: Confirmed all major components work correctly
+- **Performance validation**: Verified performance characteristics
+- **Thread safety**: Verified concurrent access safety
+- **Drive detection**: Working correctly (6 real drives detected)
+
+## v2.5.0 - v2.5.4 · Foundations (2025-10-09)
+
+### Improvements
+- **HDD protection**: Increased `hdd_max_gap_sec` from 5 to 45 seconds
+- **Drive size display**: All real drives now show correct sizes in GUI
+- **Countdown accuracy**: Verified GUI countdown calculations working correctly
+
+## v2.4.0 - v2.4.8 · Data Integrity and Logging (2025-10-09)
+
+### Monitoring & Configuration
+- **CLI monitoring**: Made CLI time remaining output interval configurable (default 15 seconds)
+- **GUI table rendering**: Fixed method name from `update_table()` to `update_drive_data()`
+- **Test suite imports**: Updated after module reorganization
+
+## v2.3.0 - v2.3.5 · Scheduler and Timing (2025-10-09)
+
+### Architecture Verification
+- **Deep integration testing**: Created 4 comprehensive test suites with 40+ integration tests
+- **Architectural verification**: Confirmed centralized timing, immutable snapshots, scheduler loop
+- **Performance validation**: Verified architecture maintains good performance
+- **Thread safety**: Validated concurrent access safety
+
+## v2.2.0 - v2.2.6 · Scheduler and Timing (2025-10-08)
+
+### Critical Fixes
+- **Scheduler loop crashes**: Fixed `AttributeError: 'CoreEngine' object has no attribute 'getstatus_snapshot'`
+- **Parameter order issues**: Corrected DriveSnapshot constructor calls
+- **Deprecated method calls**: Replaced all references to deprecated methods
+- **Enhanced type hints**: Added proper type hints for configuration fields
+
+## v2.1.0 - v2.1.9 · GUI and UX (2025-10-08)
+
+### User Experience
+- **Thread safety**: Validated concurrent access safety
+- **Error handling**: Confirmed robust error handling
+- **Memory management**: Verified reasonable memory usage
+- **Zero breaking changes**: All existing functionality preserved (49/49 tests passing)
+
+## v2.0.0 - v2.0.6 · Scheduler and Timing (2025-10-08)
+
+### Major Architectural Changes
+- **Test suite fixes**: Updated tests for new architecture
+- **Version updates**: Bumped core modules to new versions
+- **Critical bug fix**: Resolved repeated AttributeError crashes in scheduler loop
+- **Comprehensive integration testing**: Created 4 comprehensive test suites with 40+ tests
+- **Architectural verification**: Verified all major changes work correctly
+- **Performance validation**: Confirmed good performance characteristics
+
+## v1.9.0 - v1.9.8 · Pause and Policy (2025-10-07)
+
+### Code Quality
+- **Deprecated code cleanup**: Fixed remaining references to deprecated methods
+- **Parameter order fixes**: Corrected DriveSnapshot constructor calls
+- **Type hint improvements**: Enhanced type hints across modules
+- **Naming consistency**: Verified all variable and method names follow conventions
+
+## v1.8.0 - v1.8.4 · Scheduler and Timing (2025-10-07)
+
+### Scheduling Improvements
+- **Execute-then-plan loop**: Fixed scheduler execution order
+- **Next due enforcement**: Enforce `next_due ≥ now + 0.5s` to end 0-2s flicker
+- **Status cadence**: 1s status update cadence
+- **CLI summary**: 30s CLI "Next due" summary
+
+### GUI & Config
+- **Incremental table refresh**: Non-destructive table refresh
+- **Edit protection**: Strict edit-protection during refresh
+- **Config save optimization**: Eliminated save-storms (single write per logical change)
+- **Drive scans**: Batch PowerShell probing per scan
+
+### Runtime
+- **Console window**: New `hide_console_window` (default true) with migration
+- **Quieter startup**: Reduced startup noise
+
+## v1.7.0 - v1.7.7 · Pause and Policy (2025-10-07)
+
+### Documentation & Performance
+- **Tone and versioning**: Clarified conventions separating system versions from module headers
+- **Performance metrics**: Status updates ~<50ms; memory ~<50MB; cached scans ~<2s for 5 drives
+- **Cache TTLs**: Drive info 30s; volume info 60s; policy state 5s
+- **Error taxonomy**: Detailed quarantine triggers and recovery steps
+- **Security/ops**: Minimal privileges; registry only for autostart; no network; no data exfiltration
+
+## v1.6.0 - v1.6.4 · GUI and UX (2025-10-06)
+
+### Documentation
+- **Critical issues**: Identified duplicate init paths; missing PS script; version inconsistencies
+- **Success metrics**: Established production readiness checklist
+- **Clean formatting**: Standardized headings, lists, and code blocks for accessibility
+- **Quick Start**: Rewrote with explicit Standard vs Portable flows
+
+## v1.5.0 - v1.5.9 · GUI and UX (2025-10-06)
+
+### Drive Detection
+- **Unit tests**: Updated for normalized drive-letter convention
+- **Drive-letter standards**: Documented and updated detection rules
+- **Version snapshot**: Captured current file versions for cross-checking
+- **User-visible impacts**: Faster GUI, accurate size/type, consistent behavior
+
+## v1.4.0 - v1.4.6 · Scheduler and Timing (2025-10-06)
+
+### GUI & Config
+- **GUI behavior**: Global countdown in status bar; tooltips with last 3 results
+- **Config migration**: Config v3 fields and branding migration (`KeepAlivePy` → `DriveRevenant`)
+- **GUI performance**: New settings `gui_update_interval_ms` (default 500) and `gui_update_interval_editing_ms` (default 1000)
+- **Status thread**: Auto-restarts when intervals change; 2× faster default refresh
+- **Drive-letter normalization**: Fixed sizing/lookup inconsistencies
+
+## v1.3.0 - v1.3.4 · Scheduler and Timing (2025-10-06)
+
+### Scheduling Specification
+- **Module layout**: Locked in module layout and public interfaces
+- **Scheduling**: Fully specified monotonic clock, resume smoothing, canonical cadence with no drift
+- **Deterministic tie-break**: Daily tie-break using per-install `install_id` + local date
+- **HDD guard**: Effective interval cap, earlier-only offsets with tiny late slack
+- **I/O semantics**: Bounded flush via `max_flush_ms`, `SKIP_LOCKED` without shifting schedule
+
+## v1.2.0 - v1.2.7 · GUI and UX (2025-10-05)
+
+### User Experience
+- **Startup banner**: Surfaces missing/broken autostart with one-click fix
+- **Stable row order**: Header sorting disabled by default to prevent jumpy tables
+- **In-cell editing**: Guard rails to avoid clobbering active edits
+- **System tray**: Normalized presence/behavior across sessions
+- **Keyboard navigation**: Improved focus handling for faster edits
+- **Tooltips**: Added microcopy in Settings to clarify options
+
+## v1.1.0 - v1.1.6 · Scheduler and Timing (2025-10-05)
+
+### Features
+- **Diagnostics export**: Bundle (config snapshot, logs, NDJSON sample) from UI
+- **Log levels**: Sharpened retention guidance for support scenarios
+- **Autostart**: Default via Task Scheduler; resilient repair flow
+- **Portable mode**: Registry-based autostart fallback; config and logs beside executable
+- **Command-line flags**: `--portable` and `--debug` documented and respected
+
+## v1.0.0 - v1.0.6 · Data Integrity and Logging (2025-10-05)
+
+### Error Handling & Configuration
+- **Error handling**: `error_quarantine_after`/`error_quarantine_sec` for repeated failures
+- **Toggle**: `treat_unknown_as_ssd` to avoid unnecessary writes on ambiguous media
+- **Per-drive overrides**: `enabled`, `interval`, `type`, `ping_dir` formalized
+- **NDJSON schema**: Stabilized event schema for external analysis
+- **Log rotation**: Hardened via `log_max_kb` and `log_history_count`
+
+## v0.9.0 - v0.9.7 · Scheduler and Timing (2025-10-04)
+
+### Configuration & Policy
+- **Single-instance**: Enforcement and clean shutdown verified
+- **Schema v3**: Expanded keys documented and enforced
+- **Policy precedence**: Clarified (global pause, then battery, then idle, then per-drive disable)
+- **Pause controls**: `pause_on_battery` and `idle_pause_min` with safe defaults
+- **Durability controls**: `fsync`, bounded flush (`max_flush_ms`), and `lock_retry_ms`
+
+## v0.8.0 - v0.8.4 · Testing and Verification (2025-10-04)
+
+### Documentation & Build
+- **README**: Usage instructions aligned with packaging outputs
+- **Version metadata**: Conventions documented for future builds
+- **CI workflow**: GitHub Actions established for build and tests
+- **Requirements**: Normalized and reproducible installs documented
+
+## v0.7.0 - v0.7.4 · Scheduler and Timing (2025-10-04)
+
+### Autostart & UI
+- **Autostart plumbing**: Task Scheduler preferred; Registry fallback for portable
+- **Import graph**: Strengthened and removed redundant init paths
+- **Global Pause/Resume**: Toolbar and per-drive context controls
+- **Status feedback**: Immediate, clearer feedback on actions
+- **Visual polish**: Status indicators and table sizing/formatting
+
+## v0.6.0 - v0.6.6 · Scheduler and Timing (2025-10-04)
+
+### Features
+- **Error budget**: Tracking and quarantine thresholds wired into scheduler
+- **Diagnostics export**: Flow added to GUI
+- **Policy precedence**: Clarified with interval clamping and status indication
+- **Config v3 migration**: Atomic save + backups, integrity verification, and repair
+- **Main entry**: Single-instance mutex, `--debug` flag, clearer startup errors/help
+- **Logging**: Improved NDJSON schema, better rotation, timing/metadata fields
+
+## v0.5.0 - v0.5.7 · Scheduler and Timing (2025-10-03)
+
+### Scheduling
+- **JitterPlanner**: Introduced with 500ms grid and deterministic BLAKE2s tie-breaks
+- **Spacing rules**: Enforced (0.5s any-any, 1.0s write-write) and HDD-guard earlier-only offsets
+- **Collision packing**: Multi-drive collision packing (writes first, reads next) with overflow handling
+- **Logging**: Half-second timing indicators and tie-break metadata in human logs
+
+## v0.4.0 - v0.4.4 · Scheduler and Timing (2025-10-03)
+
+### GUI & Features
+- **System tray**: Integration for background operation; notifications wired
+- **Settings dialog**: Covering key configuration values with validation
+- **Real-time countdown**: "Next in" countdown column and basic keyboard navigation
+- **Change detection**: Hash-based so GUI updates only on state changes
+- **Pause/Resume**: Global & per-drive wired into policy engine
+- **Quarantine**: Retry system for transient I/O failures with bounded backoff
+
+## v0.3.0 - v0.3.7 · Pause and Policy (2025-10-03)
+
+### Status & Policy
+- **DriveStatus**: Introduced (incl. `PAUSED`) and `PolicyState` to unify GUI/core semantics
+- **Operation enums**: Expanded and status snapshot schema for stable GUI/log consumption
+- **Policy precedence**: Clarified (global pause → battery → idle → per-drive disable)
+- **PySide6 interface**: Drive table with in-cell editing and color/status indicators
+- **Context menu**: Actions for per-drive pause/resume and details
+
+## v0.2.0 - v0.2.4 · Data Integrity and Logging (2025-10-02)
+
+### Testing
+- **Basic functionality tests**: Core scheduling, I/O safety, config load/save
+- **Real-drive smoke tests**: External media and import-graph verification
+- **CI runner scripts**: Minimal scripts for local Windows runs
+- **NDJSON schema**: Sanity checks and log rotation assertions
+- **Failure-mode assertions**: `SKIP_LOCKED`, timeouts, and partial flush
+
+## v0.1.0 - v0.1.8 · Foundations (2025-10-02)
+
+### Initial Implementation
+- **First runnable baseline**: Basic config management and path layout
+- **Initial scheduler loop**: Fixed cadence and early jitter spacing
+- **I/O groundwork**: Safe write with temporary file + atomic move; basic lock retry/backoff
+- **Device probing**: Volume information collection with WMI/PowerShell helpers
+- **Error taxonomy**: Scaffolded (OK / SKIP_LOCKED / ERROR) and human logs created
+- **Test scaffolding**: Basic unit tests and real-drive smoke tests
