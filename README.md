@@ -2,7 +2,7 @@
 
 **Keep your drives hot and ready for instant access.**
 
-Drive Revenant prevents hard drives and SSDs from entering sleep mode by performing tiny read/write operations at safe intervals. This eliminates the frustrating delay when accessing files on drives that have "spun down" or entered low-power states. Drive Revenant was partially inspired by 'Keep Alive' -  a similar, if much more basic (seeing as it managed to corrupt a drive after just a few days) implementation for keeping drives active.
+Drive Revenant prevents hard drives and SSDs from entering sleep mode by performing tiny read/write operations at safe intervals. This eliminates the frustrating delay when accessing files on drives that have "spun down" or entered low-power states.
 
 ## Why Use Drive Revenant?
 
@@ -247,6 +247,7 @@ To switch modes:
 - **Fix autostart after move**: Use `--fix-autostart` if you moved a portable installation
 
 ## Architecture
+Drive Revenant's core concept was partially inspired by 'Keep Alive'
 
 ```
 ┌─────────────────────────────────────────────────────────┐
