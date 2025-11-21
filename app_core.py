@@ -4,6 +4,7 @@
 # All drive state now managed by centralized Scheduler with DriveTimingState.
 # Features: deterministic jitter planning, HDD guard logic, policy arbitration, and immutable snapshots.
 
+import math
 import time
 import threading
 import queue
@@ -211,6 +212,7 @@ class Scheduler:
             )
 
     def plan_next_operation(self, drive_letter: str, base_interval_sec: float,
+                           operation_type: OperationType,
                            last_ok_at: Optional[float] = None) -> float:
         """Plan next operation time with global spacing and deterministic jitter."""
         now = self.clock.monotonic()
@@ -231,38 +233,43 @@ class Scheduler:
             candidate = now + jitter_offset
 
         # Apply global spacing constraints
-        candidate = self._apply_global_spacing(candidate, drive_letter)
+        candidate = self._apply_global_spacing(candidate, operation_type)
 
         # Align to grid
         candidate = self._align_to_grid(candidate)
 
         return candidate
 
-    def _apply_global_spacing(self, candidate: float, drive_letter: str) -> float:
+    def _apply_global_spacing(self, candidate: float, operation_type: OperationType) -> float:
         """Apply global spacing constraints to candidate time."""
-        now = self.clock.monotonic()
-
-        # For now, simple implementation - in full version would check operation type
-        # and enforce min spacing between same-type operations globally
-
-        # Update global timestamps (simplified)
-        if "read" in drive_letter.lower():  # Simplified check
+        if operation_type == OperationType.READ:
             min_spacing = self.min_read_spacing_ms / 1000.0
-            if now - self._last_global_read_at < min_spacing:
-                candidate = max(candidate, self._last_global_read_at + min_spacing)
-            self._last_global_read_at = candidate
-        else:  # Assume write
+            last_time = self._last_global_read_at
+        elif operation_type == OperationType.WRITE:
             min_spacing = self.min_write_spacing_ms / 1000.0
-            if now - self._last_global_write_at < min_spacing:
-                candidate = max(candidate, self._last_global_write_at + min_spacing)
-            self._last_global_write_at = candidate
+            last_time = self._last_global_write_at
+        else:
+            raise ValueError(f"Unsupported operation type: {operation_type}")
 
-        return candidate
+        candidate = max(candidate, last_time + min_spacing)
+        aligned_candidate = self._align_to_grid(candidate)
+
+        # Ensure alignment did not reduce spacing below the minimum requirement
+        if aligned_candidate - last_time < min_spacing:
+            aligned_candidate = self._align_to_grid(last_time + min_spacing)
+
+        if operation_type == OperationType.READ:
+            self._last_global_read_at = aligned_candidate
+        else:
+            self._last_global_write_at = aligned_candidate
+
+        return aligned_candidate
 
     def _align_to_grid(self, time_value: float) -> float:
         """Align time to grid."""
         grid_size = self.grid_ms / 1000.0
-        return round(time_value / grid_size) * grid_size
+        steps = math.ceil(time_value / grid_size)
+        return steps * grid_size
 
     def handle_failure(self, drive_letter: str, current_failures: int) -> Tuple[bool, Optional[float]]:
         """Handle drive failure with exponential quarantine backoff."""
