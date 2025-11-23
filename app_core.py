@@ -211,6 +211,7 @@ class Scheduler:
             )
 
     def plan_next_operation(self, drive_letter: str, base_interval_sec: float,
+                           operation_type: OperationType,
                            last_ok_at: Optional[float] = None) -> float:
         """Plan next operation time with global spacing and deterministic jitter."""
         now = self.clock.monotonic()
@@ -231,29 +232,23 @@ class Scheduler:
             candidate = now + jitter_offset
 
         # Apply global spacing constraints
-        candidate = self._apply_global_spacing(candidate, drive_letter)
+        candidate = self._apply_global_spacing(candidate, operation_type)
 
         # Align to grid
         candidate = self._align_to_grid(candidate)
 
         return candidate
 
-    def _apply_global_spacing(self, candidate: float, drive_letter: str) -> float:
+    def _apply_global_spacing(self, candidate: float, operation_type: OperationType) -> float:
         """Apply global spacing constraints to candidate time."""
-        now = self.clock.monotonic()
-
-        # For now, simple implementation - in full version would check operation type
-        # and enforce min spacing between same-type operations globally
-
-        # Update global timestamps (simplified)
-        if "read" in drive_letter.lower():  # Simplified check
+        if operation_type == OperationType.READ:
             min_spacing = self.min_read_spacing_ms / 1000.0
-            if now - self._last_global_read_at < min_spacing:
+            if candidate - self._last_global_read_at < min_spacing:
                 candidate = max(candidate, self._last_global_read_at + min_spacing)
             self._last_global_read_at = candidate
-        else:  # Assume write
+        else:
             min_spacing = self.min_write_spacing_ms / 1000.0
-            if now - self._last_global_write_at < min_spacing:
+            if candidate - self._last_global_write_at < min_spacing:
                 candidate = max(candidate, self._last_global_write_at + min_spacing)
             self._last_global_write_at = candidate
 
