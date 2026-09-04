@@ -8,8 +8,10 @@
 from PySide6.QtWidgets import QMainWindow, QApplication, QSystemTrayIcon, QMenu, QMessageBox, QDialog, QFileDialog
 from PySide6.QtCore import Qt, QTimer, QPoint, Signal
 from PySide6.QtGui import QIcon, QAction, QFont, QKeySequence
+import sys
 import time
 import logging
+from pathlib import Path
 
 # Import GUI components from separate modules
 from app_gui_drive_table import DriveTableWidget, StatusIndicator, ComboBoxDelegate
@@ -25,8 +27,21 @@ from app_logging import LoggingManager
 
 # Import types
 from app_types import DriveConfig, DriveState
+from app_version import __version__
 
 logger = logging.getLogger(__name__)
+
+_APP_DIR = Path(__file__).resolve().parent
+
+
+def _icon_path(name: str) -> str:
+    """Resolve an icon path relative to the app bundle (not the CWD)."""
+    if getattr(sys, "frozen", False):
+        base = Path(getattr(sys, "_MEIPASS", _APP_DIR))
+    else:
+        base = _APP_DIR
+    p = base / name
+    return str(p) if p.exists() else name
 
 
 class MainWindow(QMainWindow):
@@ -64,7 +79,7 @@ class MainWindow(QMainWindow):
 
         # Set window properties
         self.setWindowTitle("Drive Revenant")
-        self.setWindowIcon(QIcon("DR tray icon.png"))
+        self.setWindowIcon(QIcon(_icon_path("DR tray icon.png")))
         self.resize(1200, 800)
 
     def setup_window(self):
@@ -245,22 +260,78 @@ class MainWindow(QMainWindow):
     def setup_status_bar(self):
         """Set up the status bar."""
         self.status_bar = self.statusBar()
+        self.status_bar.setMinimumHeight(44)  # give the big SAFE toggle room
         self.status_bar.showMessage("Ready", 2000)
-        
+
+        # SAFE mode toggle (bottom-left). Checked = simulated writes, no real I/O.
+        from PySide6.QtWidgets import QLabel, QCheckBox
+        self.safe_mode_check = QCheckBox("SAFE")
+        self.safe_mode_check.setToolTip(
+            "When checked, all drive operations are simulated and nothing is "
+            "written to your drives. Uncheck to enable real drive pings."
+        )
+        initial_safe = bool(self.io_manager.simulate_writes) if self.io_manager else True
+        self.safe_mode_check.setChecked(initial_safe)
+        self._style_safe_toggle(initial_safe)
+        self.safe_mode_check.toggled.connect(self._on_safe_mode_toggled)
+        self.status_bar.addWidget(self.safe_mode_check)
+        # QStatusBar hides normal widgets while a temporary message is active;
+        # force the toggle visible so it never disappears.
+        self.safe_mode_check.show()
+
         # Add permanent widget on the right side for next drives display
-        from PySide6.QtWidgets import QLabel
         self.next_drives_label = QLabel("Next: —")
         self.next_drives_label.setStyleSheet("QLabel { font-weight: bold; padding: 2px 8px; }")
         self.status_bar.addPermanentWidget(self.next_drives_label)
-        
-        # Add status legend to the left side by inserting it before the main message
+
+        # Add status legend to the right side
         legend_widget = self._create_status_legend()
         self.status_bar.insertPermanentWidget(0, legend_widget)
+
+    def _style_safe_toggle(self, safe: bool):
+        """Style the SAFE toggle: large, red while safe (no writes), green when live."""
+        background = "#d32f2f" if safe else "#2e7d32"
+        border = "#b71c1c" if safe else "#1b5e20"
+        self.safe_mode_check.setStyleSheet(f"""
+            QCheckBox {{
+                color: #ffffff;
+                background-color: {background};
+                border: 2px solid {border};
+                border-radius: 5px;
+                padding: 6px 14px;
+                font-size: 16px;
+                font-weight: 800;
+            }}
+            QCheckBox::indicator {{
+                width: 22px;
+                height: 22px;
+            }}
+        """)
+        self.safe_mode_check.setMinimumHeight(34)
+
+    def _on_safe_mode_toggled(self, checked: bool):
+        """Toggle SAFE mode (simulate writes) and persist the setting."""
+        if self.io_manager:
+            self.io_manager.set_simulate_writes(checked)
+        self._style_safe_toggle(checked)
+        if self.core_engine and hasattr(self.core_engine, 'config'):
+            self.core_engine.config.simulate_writes = checked
+            if self.config_manager:
+                try:
+                    self.config_manager.save_config(self.core_engine.config)
+                except Exception as e:
+                    logger.error(f"Failed to save SAFE mode setting: {e}")
+        if checked:
+            self.status_bar.showMessage("SAFE mode ON — drive operations are simulated (no writes)", 6000)
+        else:
+            self.status_bar.showMessage("SAFE mode OFF — real drive pings enabled", 6000)
+        # Keep the toggle visible while the status message is showing.
+        self.safe_mode_check.show()
 
     def setup_system_tray(self):
         """Set up the system tray icon."""
         self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setIcon(QIcon("DR tray icon.png"))
+        self.tray_icon.setIcon(QIcon(_icon_path("DR tray icon.png")))
 
         # Create tray menu
         tray_menu = QMenu()
@@ -513,7 +584,7 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self,
             "About Drive Revenant",
-            "Drive Revenant v1.0.0\n\n"
+            f"Drive Revenant v{__version__}\n\n"
             "Keeps external drives awake by periodically accessing them.\n\n"
             "Prevents drives from spinning down during active use."
         )
@@ -681,7 +752,7 @@ class MainWindow(QMainWindow):
             "python_version": sys.version,
             "python_bits": platform.architecture()[0],
             "processor": platform.processor(),
-            "application_version": "1.0.0",
+            "application_version": __version__,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "config_location": str(self.config_manager.config_path) if self.config_manager else "Unknown",
             "log_location": str(self.config_manager.get_log_dir()) if self.config_manager else "Unknown"
@@ -709,8 +780,8 @@ class MainWindow(QMainWindow):
                 autostart_info["autostart_method"] = config.autostart_method
                 
                 # Check autostart status
-                from app_autostart import AutostartManager
-                autostart_manager = AutostartManager(self.config_manager)
+                from app_autostart import AutostartManager, get_exe_path
+                autostart_manager = AutostartManager(get_exe_path())
                 is_valid, method, error = autostart_manager.verify_autostart()
                 
                 autostart_info["autostart_valid"] = is_valid
@@ -747,8 +818,8 @@ class MainWindow(QMainWindow):
             return
             
         try:
-            from app_autostart import AutostartManager
-            autostart_manager = AutostartManager(self.config_manager)
+            from app_autostart import AutostartManager, get_exe_path
+            autostart_manager = AutostartManager(get_exe_path())
             
             # Check current status first
             is_valid, method, error = autostart_manager.verify_autostart()

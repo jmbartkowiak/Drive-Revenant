@@ -5,6 +5,7 @@
 
 import json
 import os
+import sys
 import uuid
 import shutil
 import time
@@ -17,6 +18,19 @@ from app_types import DriveConfig
 from app_utils import sha256_head
 
 logger = logging.getLogger(__name__)
+
+
+def _exe_dir() -> Path:
+    """Directory the app is running from (frozen exe dir, else the source dir).
+
+    In a PyInstaller onefile build, `__file__` points inside the extraction
+    temp dir (_MEI), which changes every launch — so portable-mode paths must be
+    anchored to sys.executable's directory instead.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
 
 @dataclass
 class AppConfig:
@@ -38,6 +52,7 @@ class AppConfig:
     fsync: bool = True
     max_flush_ms: int = 150
     lock_retry_ms: int = 750
+    simulate_writes: bool = True  # SAFE mode: when True, drive pings are simulated (no real writes)
     error_quarantine_after: int = 5
     error_quarantine_sec: int = 60
     log_max_kb: int = 150
@@ -46,7 +61,7 @@ class AppConfig:
     disable_hotkeys: bool = False
     suppress_quit_confirm: bool = False
     suppress_ssd_warnings: Dict[str, bool] = None  # Drive letter -> suppress warning
-    gui_update_interval_ms: int = 250  # GUI update interval in milliseconds
+    gui_update_interval_ms: int = 500  # GUI update interval in milliseconds
     gui_update_interval_editing_ms: int = 1000  # GUI update interval when editing
     cli_countdown_interval_sec: int = 15  # CLI countdown logging interval in seconds
     hide_console_window: bool = False  # Hide the command terminal/console window
@@ -102,7 +117,7 @@ class ConfigManager:
 
     def _resolve_portable_mode(self) -> bool:
         """Resolve portable mode by probing both locations when not explicitly specified."""
-        portable_path = Path(__file__).parent / "config.json"
+        portable_path = _exe_dir() / "config.json"
         appdata_path = self._win_appdata_roaming() / "DriveRevenant" / "config.json"
 
         portable_exists = portable_path.exists()
@@ -169,7 +184,7 @@ class ConfigManager:
         """Get the configuration file path based on resolved portable mode."""
         if self.portable_mode:
             # Portable mode: config next to executable
-            exe_dir = Path(__file__).parent
+            exe_dir = _exe_dir()
             return exe_dir / "config.json"
         else:
             # Standard mode: AppData/DriveRevenant/config.json
@@ -184,7 +199,7 @@ class ConfigManager:
     def _get_log_dir(self) -> Path:
         """Get the log directory path based on portable mode."""
         if self.portable_mode:
-            exe_dir = Path(__file__).parent
+            exe_dir = _exe_dir()
             return exe_dir / "logs"
         else:
             appdata = self._win_appdata_roaming()
@@ -217,7 +232,9 @@ class ConfigManager:
 
             return config
 
-        except (json.JSONDecodeError, KeyError, ValueError) as e:
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
+            # TypeError covers a per_drive entry with an unknown key, which
+            # DriveConfig(**data) would otherwise let crash startup.
             logger.error(f"Failed to load config: {e}")
             logger.info("Creating backup and default config")
             self._backup_corrupted_config()
@@ -237,7 +254,7 @@ class ConfigManager:
             return
 
         try:
-            portable_config = Path(__file__).parent / "config.json"
+            portable_config = _exe_dir() / "config.json"
             appdata_config = self._win_appdata_roaming() / "DriveRevenant" / "config.json"
 
             portable_exists = portable_config.exists()
@@ -290,6 +307,9 @@ class ConfigManager:
         
         if 'lock_retry_ms' not in data:
             data['lock_retry_ms'] = 750
+        
+        if 'simulate_writes' not in data:
+            data['simulate_writes'] = True
         
         if 'error_quarantine_after' not in data:
             data['error_quarantine_after'] = 5

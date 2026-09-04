@@ -1,5 +1,5 @@
 # app_logging.py
-# Version: 1.0.4
+# Version: 1.0.5
 # Logging system for Drive Revenant with human-readable log rotation, NDJSON stream,
 # event formatting with half-second indicators, and structured telemetry.
 
@@ -490,6 +490,18 @@ class LoggingManager:
     def shutdown(self):
         """Shutdown logging system."""
         self.human_logger.log_system_event("SHUTDOWN", "Drive Revenant shutting down")
-        
-        # Close any open files
+
+        # Close the debug logger's file handler explicitly. On Windows the
+        # debug.log handle stays locked until the handler is closed, which
+        # breaks tmp_path cleanup in tests and log deletion after shutdown.
+        debug_logger = getattr(self, "debug_logger", None)
+        if debug_logger is not None:
+            for handler in list(debug_logger.handlers):
+                try:
+                    handler.close()
+                except Exception:
+                    pass
+                debug_logger.removeHandler(handler)
+
+        # Close any remaining open files
         logging.shutdown()

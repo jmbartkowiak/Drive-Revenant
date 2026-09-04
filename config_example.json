@@ -21,6 +21,7 @@
   "fsync": true,
   "max_flush_ms": 150,
   "lock_retry_ms": 750,
+  "simulate_writes": true,
   "error_quarantine_after": 5,
   "error_quarantine_sec": 60,
   "log_max_kb": 150,

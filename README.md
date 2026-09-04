@@ -2,340 +2,260 @@
 
 **Keep your drives hot and ready for instant access.**
 
-Drive Revenant prevents hard drives and SSDs from entering sleep mode by performing tiny read/write operations at safe intervals. This eliminates the frustrating delay when accessing files on drives that have "spun down" or entered low-power states.
+Drive Revenant prevents hard drives and SSDs from entering sleep mode by performing
+tiny read/write operations at safe, user-configurable intervals. This eliminates the
+multi-second wake-up delay when a drive has "spun down" or entered a low-power state.
 
-## Why Use Drive Revenant?
+It was partly inspired by *Keep Alive* — a similar but far more basic tool that
+managed to corrupt a drive after a few days. Drive Revenant is built around safety:
+bounded flushes, atomic writes, spacing rules, and exponential error quarantine.
 
-When drives go to sleep, accessing files takes several seconds while the drive wakes up. Drive Revenant keeps them active and ready, ensuring:
+---
 
-- **Instant file access** - No waiting for drives to spin up or wake from sleep
-- **Reduced data access latency** - Eliminates the 3-10 second delay when accessing sleeping drives
-- **Automatic operation** - Runs in the background, requires no interaction after setup
-- **Fast startup** - Application launches in seconds and begins monitoring immediately
-- **Low overhead** - Minimal system resources and safe, carefully-timed operations
+## Features
 
-## Quick Start
+### Safety first
+- **SAFE mode (default)** — on first start the app simulates every operation and
+  writes nothing to your drives until you uncheck the big **red SAFE** toggle in the
+  bottom-left of the window (it turns green when live). Only then are real drive pings
+  written.
+- **Tiny operations** — each ping is a single read or write of a <1 KB file
+  (`X:\.drive_revenant\drive_revenant`).
+- **Atomic writes** — writes go to a temp file and are atomically replaced, with an
+  optional `fsync` and a bounded flush (`max_flush_ms`).
+- **Spacing rules** — minimum spacing between operations (500 ms read, 1000 ms write)
+  prevents I/O storms across many drives.
+- **HDD guard** — mechanical drives are capped to a maximum gap (`hdd_max_gap_sec`)
+  so they never sleep for too long, while still respecting the configured interval.
+- **Exponential quarantine** — a drive that fails repeatedly is temporarily disabled
+  with exponential backoff (30 s -> ~21 days) and recovers automatically.
+- **Lock retry** — graceful handling of file locks and antivirus interference
+  (`SKIP_LOCKED`).
 
-### Installation (One-Time Setup)
+### Intelligent scheduling
+- **Monotonic clock** — all timing uses `time.monotonic()`, so there is no drift and
+  no confusion with wall-clock changes.
+- **Deterministic jitter** — daily tie-breaking seeded by `install_id` + date keeps
+  multi-drive scheduling stable and collision-free.
+- **Effective interval** — the user-configured interval is kept intact; the effective
+  interval (after minimum clamping and HDD capping) is derived separately and shown in
+  the UI. A clamped or HDD-capped drive is labeled accordingly.
+- **Resume smoothing** — pausing/resuming clears and re-plans the schedule cleanly;
+  paused drives are never re-planned behind your back.
 
-1. **Install Python dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
+### User controls
+- **Global Pause / Resume** for all drives.
+- **Per-drive** enable/disable, pause/resume, ping-now, and release-from-quarantine
+  via a right-click context menu.
+- **In-cell editing** for interval and drive type.
+- **Real-time countdown** ("Next in" column) computed from the effective interval.
+- **System tray** integration for background operation.
+- **Full Rescan (Clear All)** to reset and re-detect all drives.
 
-2. **Run the application:**
-   ```bash
-   python main.py
-   ```
+### Low overhead
+- Starts in seconds and begins monitoring immediately.
+- GUI emits snapshots only when state changes (or once per second for the countdown
+  tick) instead of repainting on every poll.
+- Cheap O(n log n) "next drives" preview derived from the live schedule.
 
-That's it! The application will:
-- Start in under 2 seconds
-- Automatically detect available drives
-- Begin keeping drives active using safe, configurable intervals
-- Minimize to system tray for background operation
+---
 
-### First Run
+## Quick start
 
-1. **Launch the application** - The GUI appears showing all detected drives
-2. **Review detected drives** - Each drive shows its current status, type, and next operation time
-3. **Configure intervals** - Double-click any drive's "Interval" cell to set how often it should be accessed (default: 20 seconds - though I would suggest ~8s for HDDs)
-4. **Enable/disable drives** - Right-click any drive to enable or disable monitoring
-5. **Minimize to tray** - Click the minimize button to run in the background
+### Install
 
-No complex configuration needed - most defaults work immediately.
+```bash
+pip install -r requirements.txt
+```
 
-## Core Purpose: Preventing Drive Sleep
+Requirements: Python 3.10+, Windows, and `PySide6`, `psutil`, `pywin32`.
 
-Drive Revenant performs small read/write operations to drive files at regular intervals. This prevents Windows from putting drives into:
-- **Sleep mode** (spinning drives)
-- **Low-power states** (SSDs)
-- **Complete shutdown** (removable drives)
+### Run
 
-The result: **your drives stay active and ready for instant access**, eliminating the frustrating delay when opening files on drives that have gone to sleep.
+```bash
+python main.py
+```
 
-### How It Works
+The app detects drives, begins keeping them active, and minimizes to the system tray.
 
-- **Tiny operations**: Each drive gets a small read or write operation (typically <1KB)
-- **Safe intervals**: User-configurable intervals (default: 20 seconds, minimum: 3 seconds)
-- **Intelligent scheduling**: Prevents collisions between drives using deterministic timing
-- **HDD protection**: Mechanical drives get extra protection with longer minimum intervals
-- **Automatic recovery**: Failed operations trigger quarantine with exponential backoff 
+### First run
 
-## Key Features
+1. Launch the app — the GUI shows all detected drives.
+2. Note the **SAFE** checkbox in the bottom-left: it starts checked, so all
+   operations are simulated and nothing is written to your drives.
+3. Review each drive's status, type, and next-operation countdown.
+4. When you are ready for the app to write real pings, **uncheck SAFE**.
+5. Double-click the **Interval (s)** cell to change how often a drive is accessed
+   (default 180 s; ~8 s is a common choice for HDDs).
+6. Right-click a drive to enable/disable, pause/resume, ping now, or view details.
+7. Minimize to tray to run in the background.
 
-### Safety First
-- **Spacing rules**: Minimum 0.5s between any operations, 1.0s between writes
-- **HDD guard**: Protective timing for mechanical drives (5-minute minimum gap for safety)
-- **Error quarantine**: Automatic temporary disable after consecutive failures with exponential backoff
-- **Lock retry**: Graceful handling of file locks and antivirus interference
-- **Bounded operations**: Flush times capped to prevent UI stalls
+---
 
-### Intelligent Scheduling
-- **500ms grid-based timing** with monotonic clock (no drift)
-- **Deterministic tie-breaking** per install and day; collision packing (writes first, reads next)
-- **Resume smoothing** when app resumes from pause or sleep
-- **Multi-drive collision handling** with stable ordering
+## Command line
 
-### User-Friendly Controls
-- **Global Pause/Resume** for all drives
-- **Per-drive control** via context menu (right-click)
-- **In-cell editing** for intervals and drive types
-- **Real-time countdowns** showing "Next in" time or "Due now"
-- **System tray integration** for background operation
-- **Full Rescan** option to reset and re-detect all drives
-
-### Rapid Startup & Performance
-- **Fast launch**: Application starts in under 2 seconds
-- **Immediate operation**: Begins monitoring drives immediately on startup
-- **Low overhead**: <50MB memory, <1% CPU usage
-- **Incremental updates**: GUI refreshes only when state changes (500ms normal, 1000ms while editing)
-
-## Usage
-
-### Command Line Options
-
-| Option | Descrption |
+| Option | Description |
 |--------|-------------|
-| `--portable` | Run in portable mode (config/logs beside executable). See [Modes](#modes) section for details on when and why to use portable mode. |
-| `--no-autostart` | Disable autostart setup |
-| `--fix-autostart` | Repair autostart entry and exit (especially useful after moving a portable installation) |
-| `--debug` | Increase log verbosity |
-| `--version` | Show version info |
+| `--portable` | Run in portable mode (config/logs beside the executable). |
+| `--no-autostart` | Disable autostart setup. |
+| `--fix-autostart` | Repair the autostart entry and exit. |
+| `--config-info` | Print resolved configuration information and exit. |
+| `--debug` | Increase log verbosity. |
+| `--version` | Show version info. |
 
-### GUI Overview
-
-- **Drive table**: Shows all detected drives with status, type, interval, and countdown
-- **Status bar**: Global countdown and policy status
-- **Toolbar**: Pause/Resume all drives button
-- **System tray**: Minimize to tray for background operation
-- **Menu bar**: File menu includes "Full Rescan (Clear All)" for complete reset
-
-### Status Indicators
-
-- **Active** (green): Drive is being monitored and kept active
-- **Paused** (yellow): Temporarily paused (user, global, battery, or idle policy)
-- **Quarantine** (yellow): Temporarily disabled due to errors (exponential backoff)
-- **Disabled** (red): Manually disabled by user
-- **Offline** (red): Drive not detected or removed
-
-### Per-Drive Context Menu (Right-Click)
-
-- **Ping now**: Immediately perform an operation on this drive
-- **Enable/Disable**: Toggle monitoring for this drive
-- **Pause/Resume**: Temporarily pause this drive (preserves interval settings)
-- **Release from Quarantine**: Manually clear quarantine status
-- **Drive details**: View detailed information about the drive
-
-### Display Format
-
-- **"Next in" column**: Shows time until next operation (e.g., "15s", "2m", "Due now")
-- **"Due now"**: Displayed when next operation is less than 1 second away
-- **"---"**: Displayed when no operation is scheduled (disabled, paused, or quarantined)
+---
 
 ## Configuration
 
-Configuration is automatically migrated from older versions or created with safe defaults on first run. No manual configuration required.
+Configuration is created with safe defaults on first run and migrated from older
+versions automatically. Keys live in `config.json`.
 
-### Key Settings (config.json)
-
-```json
+```jsonc
 {
-  "version": 4,
-  "default_interval_sec": 20,
-  "interval_min_sec": 3,
-  "hdd_max_gap_sec": 300.0,
-  "error_quarantine_after": 5,
-  "pause_on_battery": true,
+  "version": 5,
+  "install_id": "<uuid>",
+  "portable": false,
   "autostart": true,
+  "autostart_method": "scheduler",          // "scheduler" or "registry"
+  "default_interval_sec": 180,
+  "interval_min_sec": 5,
+  "jitter_sec": 2,
+  "hdd_max_gap_sec": 300.0,                // 5 min cap for HDDs
+  "deadline_margin_sec": 0.3,
+  "pause_on_battery": false,
+  "idle_pause_min": 0,                       // 0 = disabled
+  "fsync": true,
+  "max_flush_ms": 150,
+  "lock_retry_ms": 750,
+  "simulate_writes": true,                 // SAFE mode: true = simulate, no real writes
+  "error_quarantine_after": 5,
+  "error_quarantine_sec": 60,               // base; exponential backoff extends this
+  "log_max_kb": 150,
+  "log_history_count": 5,
+  "log_ndjson": true,
+  "gui_update_interval_ms": 500,
+  "gui_update_interval_editing_ms": 1000,
+  "cli_countdown_interval_sec": 15,
+  "scheduler_grid_ms": 250,
+  "scheduler_min_read_spacing_ms": 500,
+  "scheduler_min_write_spacing_ms": 1000,
+  "drive_stale_removal_days": 15,           // 0 = disabled
+  "drive_scan_mode": "quick",               // "quick" or "full"
+  "forced_drive_letters": "",               // e.g. "F,J,K"
   "per_drive": {
-    "E:": {"enabled": true, "interval": 120, "type": "HDD"}
+    "E:": { "enabled": true, "interval": 10, "type": "HDD", "ping_dir": null }
   }
 }
 ```
 
-**Important settings:**
-- `default_interval_sec`: Default interval for new drives (20 seconds)
-- `interval_min_sec`: Minimum allowed interval (3 seconds)
-- `hdd_max_gap_sec`: Maximum gap for HDD protection (300 seconds = 5 minutes)
-- `error_quarantine_after`: Consecutive failures before quarantine (5)
-- `pause_on_battery`: Automatically pause when on battery power
-- `autostart`: Start with Windows automatically
+**Important settings**
+
+- `default_interval_sec` — interval for newly discovered drives.
+- `interval_min_sec` — hard floor applied to every drive.
+- `hdd_max_gap_sec` — maximum gap allowed for HDDs before the interval is capped.
+- `simulate_writes` — SAFE mode (default `true`): when `true`, all operations are
+  simulated and nothing is written to drives. Set `false` (or uncheck **SAFE** in the
+  GUI) to enable real drive pings.
+- `error_quarantine_after` — consecutive failed ticks before a drive is quarantined.
+- `pause_on_battery` / `idle_pause_min` — policy pauses.
+- `drive_stale_removal_days` — remove drives not seen for this many days (only at max
+  quarantine level; 0 disables removal).
 
 ### Modes
 
-Drive Revenant supports two operating modes: **Standard mode** (default) and **Portable mode**. Choose based on your needs:
+**Standard mode (default)** stores config in `%APPDATA%\DriveRevenant\` and uses Task
+Scheduler for autostart. **Portable mode** (`--portable`, or a `config.json` with
+`"portable": true` beside the executable) keeps everything in the app folder and uses
+the Registry for autostart.
 
-#### Standard Mode (Default)
-
-**When it's enabled:**
-- Default mode when no `--portable` flag is used
-- Auto-detection prefers standard mode when both config locations exist
-- Used automatically when config exists in `%APPDATA%\DriveRevenant\`
-
-**Storage locations:**
-- Configuration: `%APPDATA%\DriveRevenant\config.json`
-- Logs: `%APPDATA%\DriveRevenant\logs\`
-- Autostart: Windows Task Scheduler (preferred method)
-
-**Why use standard mode:**
-- **System-wide installation**: Settings persist across user sessions
-- **Clean separation**: Application files separate from user data
-- **Task Scheduler autostart**: More reliable, system-managed autostart
-- **Multi-user friendly**: Each Windows user has their own configuration
-- **Standard Windows practice**: Follows typical application installation patterns
-
-**Best for:**
-- Permanent installation on your primary computer
-- When you want settings to persist across application updates
-- Multi-user systems where each user needs independent configuration
-- When you want the most reliable autostart mechanism
-
-#### Portable Mode
-
-**When it's enabled:**
-- Explicitly: Use `--portable` command-line flag
-- Auto-detection: When only `config.json` exists beside the executable AND it contains `"portable": true`
-- Auto-detection priority: If both portable and AppData configs exist, standard mode is preferred
-
-**Storage locations:**
-- Configuration: `config.json` beside the executable
-- Logs: `logs\` folder beside the executable
-- Autostart: Windows Registry entries (tied to executable path)
-
-**Why use portable mode:**
-- **Self-contained**: All files (config, logs, application) in one folder
-- **USB drive friendly**: Perfect for running from removable drives
-- **No system impact**: No files written to `%APPDATA%` or system directories
-- **Easy backup**: Copy the entire folder to backup or move between computers
-- **Clean uninstall**: Simply delete the folder - nothing left behind
-- **Multiple instances**: Run multiple independent copies with different settings
-
-**Best for:**
-- USB drives or external hard drives
-- Running from a specific folder without system-wide installation
-- When you want to keep everything together (config, logs, application)
-- Temporary installations or testing
-- Moving the application between computers
-- Situations where you can't or don't want to write to `%APPDATA%`
-
-**Important considerations:**
-- **Path dependency**: Autostart breaks if you move the executable folder (use `--fix-autostart` to repair)
-- **No global settings**: Each portable copy has completely independent configuration
-- **Registry autostart**: Less robust than Task Scheduler; requires registry write permissions
-- **USB eject safety**: Always properly eject USB drives to avoid data corruption
-
-#### Auto-Detection Behavior
-
-When `--portable` is not specified, the application automatically detects the mode:
-
-1. **Both configs exist**: Prefers standard mode (AppData location)
-2. **Only AppData config exists**: Uses standard mode
-3. **Only portable config exists**: Checks if `config.json` contains `"portable": true`
-   - If `true`: Uses portable mode
-   - If `false` or missing: Uses standard mode
-4. **Neither exists**: Defaults to standard mode (creates config in AppData)
-
-#### Switching Between Modes
-
-You can run multiple instances simultaneously:
-- **One standard mode instance**: Global autostart, system-wide settings
-- **Multiple portable instances**: Each with independent settings and autostart
-
-To switch modes:
-- **Enable portable**: Run with `--portable` flag (creates local `config.json`)
-- **Switch to standard**: Delete local `config.json` and run without `--portable` flag
-- **Fix autostart after move**: Use `--fix-autostart` if you moved a portable installation
+---
 
 ## Architecture
-Drive Revenant's core concept was partially inspired by 'Keep Alive'
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    Drive Revenant                       │
-├─────────────────────────────────────────────────────────┤
-│  main.py              - Application entry point         │
-├─────────────────────────────────────────────────────────┤
-│  app_config.py        - Configuration & autostart       │
-│  app_core.py          - Core scheduling engine          │
-│  app_io.py            - I/O operations & probing        │
-│  app_logging.py       - Logging & telemetry             │
-│  app_gui.py           - PySide6 user interface          │
-│  app_types.py         - Types shared across modules     │
-└─────────────────────────────────────────────────────────┘
+main.py                     Entry point, CLI, single-instance, lifecycle
+app_config.py               Pure persistence layer (load/save/migrate config)
+app_core.py                 CoreEngine + Scheduler (single source of truth) + JitterPlanner
+app_io.py                   I/O operations, drive detection, failure classification
+app_logging.py              Human log rotation + NDJSON events
+app_gui.py                  MainWindow (menus, toolbar, tray, status bar)
+app_gui_drive_table.py      Drive table (in-cell editing, countdown, context menu)
+app_gui_status_thread.py    Background snapshot emitter (change/tick gated)
+app_gui_settings_dialog.py  Preferences dialog
+app_gui_log_viewer.py       Log viewer
+app_autostart.py            Task Scheduler / Registry autostart
+app_types.py                Shared dataclasses + enums
+app_utils.py                Small shared helpers
 ```
 
-**Core components:**
-- `CoreEngine`: Centralized scheduling with monotonic timing, jitter placement, collision spacing
-- `Scheduler`: Single source of truth for all drive timing and state
-- `IOManager`: Safe reads/writes to `X:\.drive_revenant\drive_revenant` with bounded flush
-- `JitterPlanner`: Deterministic grid scheduling and HDD protection
-- GUI subsystems: Table widget, status thread, settings, log viewer, diagnostics export
+### Scheduling model
+
+- `Scheduler` owns all drive timing/state in `_drive_timing` and publishes immutable
+  `StatusSnapshot`s under a lock.
+- `JitterPlanner` computes the **effective interval** (min-clamped, HDD-capped) without
+  mutating the user's configured interval, and places operations with deterministic
+  jitter and spacing.
+- `CoreEngine._scheduler_loop` plans, executes due operations, and re-plans on a
+  ~500 ms cadence; it never re-plans a paused or quarantined drive.
+
+---
+
+## Testing
+
+```bash
+pytest                          # run the current suite (defaults to `-m "not slow"`)
+pytest -m slow                  # run the opt-in slow suite (real drive detection/fsync)
+pytest tests/TEST_scheduler_centralized.py   # run a specific module
+```
+
+The `tests/` directory holds the **current** suite (254 tests: 240 fast + 14 `slow`).
+`pytest.ini` deselects the `slow`-marked tests by default, since they exercise real drive
+detection, fsync, and performance timings that depend on the machine. Legacy tests from
+older architectures (pre-Scheduler, pre-`drive_states` removal, script-style verification
+files) were moved to `archive/legacy_tests/` and are intentionally not collected.
+
+`tests/conftest.py` provides the shared fixtures and stubs out the I/O manager so the
+fast suite runs offline and quickly.
+
+---
+
+## Repository layout & git
+
+The repository is a Git working tree. Runtime/scratch artifacts are ignored via
+`.gitignore`: `__pycache__/`, `.pytest_cache/`, `logs/`, `test_logs/`, `config.json`,
+`build/`, `dist/`, and `archive/` (kept on disk for history, not tracked).
+
+- `README.md` — this document.
+- `VERSION_HISTORY.md` — project-level change log.
+- `TODO.md` — remaining and deferred issues.
+
+---
 
 ## Troubleshooting
 
-### Common Issues
+- **Autostart not working** — File -> Fix Autostart, or `python main.py --fix-autostart`.
+- **Drive shows "Quarantine"** — right-click -> Release from Quarantine. Quarantine is
+  automatic after repeated failures and uses exponential backoff.
+- **Countdown stuck at "Due now"** — resolves within a second or two; use File ->
+  Full Rescan (Clear All) if it persists.
+- **Drive locked (antivirus)** — operations skip as `SKIP_LOCKED`; the schedule continues.
+- **Sluggish UI** — increase `gui_update_interval_ms`, or hide heavy columns.
 
-**Autostart not working:**
-- Use the in-app "Fix Autostart" option from the File menu
-- Or run: `python main.py --fix-autostart`
+---
 
-**Drive shows as quarantined:**
-- Right-click the drive → "Release from Quarantine"
-- Quarantine is automatic after 5 consecutive failures
-- Quarantine uses exponential backoff: 30s, 1m, 2m, 4m, 8m, 16m, 32m, 1h, 2h, 4h, 8h, ~21 days
+## Security & privacy
 
-**Countdown stuck at "Due now":**
-- This should resolve within 1-2 seconds as operations execute
-- If persistent, use "Full Rescan (Clear All)" from File menu to reset
+- No network access, no telemetry, no data exfiltration.
+- All operations are local file I/O.
+- Only autostart registry/scheduler writes (optional).
+- Logs are local only.
 
-**Drive locked (antivirus interference):**
-- Operations automatically skip locked drives as `SKIP_LOCKED`
-- Schedule continues normally; no action needed
+See `TODO.md` for known limitations and deferred work, and `SECURITY.md` for the
+safety model and reporting process.
 
-**Sluggish UI:**
-- Increase `gui_update_interval_ms` in config (default: 500ms)
-- Or hide heavy columns in the table
+---
 
-**Portable path moved:**
-- Run `python main.py --fix-autostart` after relocating the folder
+## License
 
-## Security and Privacy
-
-- **No network access**: Application never connects to the internet
-- **No data exfiltration**: All operations are local file I/O
-- **Minimal registry writes**: Only autostart entries (optional)
-- **Local logs only**: All logs stay on your machine
-- **No telemetry**: No usage tracking or reporting
-
-## Recent Updates
-
-### v3.3.2 (2025-10-25) - Countdown & Interval Fixes
-- **Exponential quarantine**: Smart backoff system (30s → ~21 days) for failed drives
-- **Countdown display fix**: Shows "Due now" instead of "0s" or "-" for better clarity
-- **Interval override fix**: Increased HDD protection from 5s to 300s (5 minutes) to respect configured intervals
-- **Full rescan feature**: Added "Full Rescan (Clear All)" menu option to reset all drives
-- **Tray exit fix**: Fixed exit from system tray menu
-- **Scheduler migration**: Complete migration to centralized scheduler-based architecture
-
-### v3.1.0 (2025-10-11) - Critical Bug Fixes
-- Fixed scheduler loop crashes and parameter mismatches
-- Improved exit mechanism with force exit timer
-- Log rotation overhaul (numbered scheme)
-- CLI countdown configuration
-
-See [VERSION_HISTORY.md](VERSION_HISTORY.md) for complete version history.
-
-## Development
-
-### Running Tests
-```bash
-pytest
-pytest --cov=app_core --cov=app_config --cov=app_io
-```
-
-### Code Quality
-```bash
-black .
-ruff check .
-mypy .
-```
+[MIT](LICENSE) © 2026 Drive Revenant contributors. See [CONTRIBUTING.md](CONTRIBUTING.md)
+for how to build, test, and contribute.

@@ -6,6 +6,52 @@
 
 Drive Revenant prevents drives from entering sleep mode by performing tiny read/write operations at safe intervals. This eliminates data access latency that occurs when drives must wake from sleep states, ensuring instant file access.
 
+## v3.4.0 · Scheduler Rewrite, Cleanup & Packaging (2026-08-12)
+
+### Architecture
+- **Single source of truth**: `Scheduler` owns all drive timing/state in `_drive_timing` and publishes immutable `StatusSnapshot`s under a lock.
+- **JitterPlanner**: The effective interval (min-clamped, HDD-capped) is derived without mutating the user's configured interval; operations are placed with deterministic jitter and spacing.
+- **Legacy API removal**: Dropped the old `drive_states` dictionary, `_get_status_snapshot`, and `write_keep_alive_file` paths; all consumers now read `get_all_drive_states()` / `get_snapshot()`.
+- **Dead code removal**: Removed unused scheduler helpers and stale GUI paths (`app_core.py`, `app_gui.py`).
+
+### Packaging
+- **Single version source**: Version now lives in `app_version.py` (`__version__ = "3.4.0"`).
+- **PyInstaller spec**: Added `assets/icon.ico` and `assets/version_info.txt`; the tray PNGs are bundled and resolved via `_MEIPASS` when frozen (`_icon_path`). Fixed the spec to resolve paths via `SPECPATH` (spec files are exec'd, so `__file__` is undefined); a onefile build was verified end-to-end.
+
+### Logging
+- **Debug handler shutdown**: `LoggingManager.shutdown()` now closes the debug logger's file handler, releasing the `debug.log` lock on Windows.
+
+### Drive type detection (no PowerShell)
+- Replaced the `get_drive_types.ps1` string-matching script with an in-process,
+  no-admin detection chain in `app_io.py`: `GetDriveTypeW` for the coarse type,
+  then `DeviceIoControl` `IOCTL_STORAGE_QUERY_PROPERTY` seek-penalty/bus-type
+  queries on `\\.\PhysicalDriveN`, a WMI `MSFT_PhysicalDisk.MediaType` fallback,
+  and a model/friendly-name heuristic for USB/SCSI enclosures.
+- Removes the PowerShell dependency (AppLocker / constrained-language-mode safe).
+
+### SAFE mode (write gate)
+- New `simulate_writes` config flag (default `true`) plus a **SAFE** checkbox in the
+  bottom-left of the window. When checked, `perform_operation` simulates every operation
+  and writes nothing to drives; uncheck it to enable real drive pings.
+- The SAFE toggle is large and red while safe (green when live), and is forced visible
+  so status-bar messages can't hide it.
+
+### Test suite cleanup
+- **Archived legacy tests**: Moved stale tests referencing the pre-`drive_states`/`_get_status_snapshot` APIs, script-style verification files, and removed-API GUI tests to `archive/legacy_tests/`.
+- **Current suite**: `tests/` now holds only the current, passing suite (254 tests: 240 fast + 14 slow, all green). The slow suite dropped from ~110 s to ~11 s once the PowerShell drive-detection shell-out was removed.
+- **Multi-drive quarantine test**: Implemented the previously-skipped `test_full_cycle_with_multiple_drives` to verify per-drive countdown independence.
+
+### Review & hardening pass
+- Fixed autostart to point at the real exe (`get_exe_path()`) instead of a
+  `ConfigManager` repr; XML-escaped the Task Scheduler path.
+- Made full-rescan and stale-drive removal clear scheduler state under the lock
+  (`Scheduler.clear_all()` / `remove_drive()`).
+- Hardened the GUI status thread (snapshot errors no longer kill it; bounded stop wait).
+- Portable mode now anchors config/logs to `sys.executable`'s dir when frozen.
+- Config load tolerates unknown `per_drive` keys; failure classification prefers
+  `exception.winerror`; idle detection uses unsigned tick math; WD SSD name markers added.
+- Manual verification items captured in `USER-TODO.md`.
+
 ## v3.3.2 · Countdown & Interval Fixes (2025-10-25)
 
 ### Exponential Quarantine System

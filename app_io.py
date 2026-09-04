@@ -1,17 +1,17 @@
 # app_io.py
-# Version: 1.1.0
+# Version: 1.2.0
 # I/O operations module for Drive Revenant with durability timing, lock retry logic,
-# result taxonomy (OK, PARTIAL_FLUSH, SKIP_LOCKED), simplified PowerShell-based drive type detection, and drive_revenant file management.
+# result taxonomy (OK, PARTIAL_FLUSH, SKIP_LOCKED), hardware-signal drive type detection
+# (Win32 storage IOCTLs + WMI, no PowerShell), and drive_revenant file management.
 
 import os
 import time
 import threading
 import tempfile
 import ctypes
-import subprocess
-import json
+import struct
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 from dataclasses import dataclass
 from enum import Enum
 import logging
@@ -27,6 +27,72 @@ ERROR_ACCESS_DENIED = 5
 ERROR_SHARING_VIOLATION = 32
 
 logger = logging.getLogger(__name__)
+
+# --- Win32 storage detection constants (no PowerShell, no admin) ---
+
+# IOCTL_STORAGE_QUERY_PROPERTY = CTL_CODE(0x2D, 0x0500, METHOD_BUFFERED, FILE_ANY_ACCESS)
+IOCTL_STORAGE_QUERY_PROPERTY = 0x002D1400
+# IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS = CTL_CODE(0x56, 0x0000, METHOD_BUFFERED, FILE_ANY_ACCESS)
+IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS = 0x00560000
+
+# STORAGE_PROPERTY_ID values (ntddstor.h)
+STORAGE_DEVICE_PROPERTY = 0
+STORAGE_DEVICE_SEEK_PENALTY_PROPERTY = 7
+# STORAGE_QUERY_TYPE
+PROPERTY_STANDARD_QUERY = 0
+
+# STORAGE_BUS_TYPE values (ntddstor.h) — subset used for classification
+BUS_TYPE_USB = 0x07
+BUS_TYPE_SAS = 0x0A
+BUS_TYPE_SATA = 0x0B
+BUS_TYPE_FILE_BACKED_VIRTUAL = 0x0F
+BUS_TYPE_SPACES = 0x10
+BUS_TYPE_NVME = 0x11
+BUS_TYPE_SCM = 0x12
+
+# MSFT_PhysicalDisk.MediaType (root\Microsoft\Windows\Storage)
+WMI_MEDIA_TYPE = {0: None, 3: "HDD", 4: "SSD", 5: "SCM"}
+
+# CreateFileW flags
+GENERIC_NONE = 0
+FILE_SHARE_READ = 0x00000001
+FILE_SHARE_WRITE = 0x00000002
+FILE_SHARE_DELETE = 0x00000004
+OPEN_EXISTING = 3
+FILE_ATTRIBUTE_NORMAL = 0x00000080
+FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+# ctypes prototypes (set lazily to avoid import-time side effects)
+_kernel32 = ctypes.windll.kernel32
+_kernel32.CreateFileW.restype = ctypes.c_void_p
+_kernel32.CreateFileW.argtypes = [
+    ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+    ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+]
+_kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+_kernel32.DeviceIoControl.argtypes = [
+    ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32,
+    ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p,
+]
+_kernel32.DeviceIoControl.restype = ctypes.c_int
+
+
+class _STORAGE_PROPERTY_QUERY(ctypes.Structure):
+    _fields_ = [
+        ("PropertyId", ctypes.c_uint32),
+        ("QueryType", ctypes.c_uint32),
+        ("AdditionalParameters", ctypes.c_ubyte * 1),
+    ]
+
+
+class _DEVICE_SEEK_PENALTY_DESCRIPTOR(ctypes.Structure):
+    _fields_ = [
+        ("Version", ctypes.c_uint32),
+        ("Size", ctypes.c_uint32),
+        ("IncursSeekPenalty", ctypes.c_ubyte),  # BOOLEAN: TRUE=HDD, FALSE=SSD
+    ]
+
 
 @dataclass
 class IOResult:
@@ -47,11 +113,13 @@ class IOManager:
         self.max_flush_ms = config.max_flush_ms
         self.lock_retry_ms = config.lock_retry_ms
         self.fsync_enabled = config.fsync
+        # SAFE mode: when True, operations are simulated and no real writes happen.
+        self.simulate_writes = bool(getattr(config, 'simulate_writes', True))
         
         # Track ping directories per drive
         self.ping_dirs: Dict[str, Path] = {}
         
-        # Cache for drive type detection to avoid repeated PowerShell calls
+        # Cache for drive type detection to avoid repeated storage queries
         self._drive_type_cache: Dict[str, str] = {}
         self._cache_timestamp: float = 0
         self._cache_ttl: float = 30.0  # Cache for 30 seconds
@@ -67,27 +135,23 @@ class IOManager:
     
     def _classify_failure(self, exception: Exception) -> str:
         """Classify failure based on Windows error codes and exception type."""
-        # Get Windows error code
-        error_code = ctypes.get_last_error()
-        
+        # Prefer the exception's own winerror (reliable). ctypes.get_last_error()
+        # only reflects the last use_last_error=True call and can be stale.
+        error_code = getattr(exception, 'winerror', None)
+        if error_code is None:
+            error_code = ctypes.get_last_error()
+
         # Check for device-related errors
         if error_code in (ERROR_NOT_READY, ERROR_DEVICE_NOT_CONNECTED, ERROR_MEDIA_CHANGED):
             return "DEVICE_GONE"
-        
+
         # Check for path-related errors (device gone)
         if error_code == ERROR_PATH_NOT_FOUND:
             return "DEVICE_GONE"
-        
+
         # Check for locking/sharing errors
         if error_code in (ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION):
             return "LOCKED"
-        
-        # Check exception attributes for additional clues
-        if hasattr(exception, 'winerror'):
-            if exception.winerror in (ERROR_NOT_READY, ERROR_DEVICE_NOT_CONNECTED, ERROR_MEDIA_CHANGED, ERROR_PATH_NOT_FOUND):
-                return "DEVICE_GONE"
-            if exception.winerror in (ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION):
-                return "LOCKED"
         
         if hasattr(exception, 'errno'):
             # Common errno values that indicate device issues
@@ -114,6 +178,10 @@ class IOManager:
         # Use default: X:\.drive_revenant\
         return Path(f"{drive_letter}\\.drive_revenant")
     
+    def set_simulate_writes(self, value: bool) -> None:
+        """Enable/disable SAFE mode (simulate operations, no real writes)."""
+        self.simulate_writes = bool(value)
+
     def ensure_ping_directory(self, ping_dir: Path) -> bool:
         """Ensure the ping directory exists."""
         try:
@@ -129,6 +197,19 @@ class IOManager:
 
         try:
             logger.debug(f"Starting I/O operation: {drive_state.letter} {operation.operation_type.value}")
+
+            # SAFE mode: simulate the operation without touching the drive. No
+            # directory is created and no bytes are read or written.
+            if self.simulate_writes:
+                logger.debug(f"{drive_state.letter}: SAFE mode — simulating {operation.operation_type.value} operation")
+                return IOResult(
+                    result_code=ResultCode.OK,
+                    duration_ms=0.0,
+                    details="Simulated (SAFE mode)",
+                    offset_ms=operation.offset_ms,
+                    jitter_reason=operation.jitter_reason,
+                    pack_size=operation.pack_size
+                )
 
             # Get ping directory
             ping_dir = self.get_ping_directory(drive_state.letter, drive_state.config.ping_dir)
@@ -414,7 +495,7 @@ class IOManager:
             current_time = time.time()
             self._drive_type_cache.update(all_drive_types)
             self._cache_timestamp = current_time
-            # During the active scan, avoid re-invoking PowerShell; trust cache
+            # During the active scan, avoid re-running detection; trust cache
             self._scan_prefetched_until = current_time + 300.0  # 5 minutes
             logger.debug(f"Cached {len(all_drive_types)} drive types")
 
@@ -504,8 +585,8 @@ class IOManager:
 
             # Check if we can actually access the drive
             try:
-                # Try to list directory contents
-                list(drive_path.iterdir())
+                # Probe media access without enumerating the whole root
+                next(iter(drive_path.iterdir()), None)
             except (PermissionError, OSError) as e:
                 logger.debug(f"Drive {drive_letter} not accessible: {e}")
                 return {
@@ -515,7 +596,7 @@ class IOManager:
                     "error": str(e)
                 }
 
-            # Get drive type using the simplified PowerShell-based detection
+            # Get drive type using the hardware-signal detection chain
             drive_type = self._detect_drive_type_simplified(drive_letter)
             
             # Apply treat_unknown_as_ssd setting if available
@@ -573,11 +654,11 @@ class IOManager:
             }
     
     def _detect_drive_type_simplified(self, drive_letter: str) -> str:
-        """Detect drive type using simplified PowerShell-based detection."""
+        """Detect drive type using the hardware-signal detection chain."""
         try:
             # Check cache first (should be populated by scan_available_drives)
             current_time = time.time()
-            # Use drive letter with colon for cache lookup (consistent with PowerShell output)
+            # Use drive letter with colon for cache lookup
             drive_key = f"{drive_letter}:"
 
             # If we recently prefetched for a scan, always use cache
@@ -588,82 +669,246 @@ class IOManager:
             if (current_time - self._cache_timestamp) < self._cache_ttl and drive_key in self._drive_type_cache:
                 logger.debug(f"Using cached drive type for {drive_letter}: {self._drive_type_cache[drive_key]}")
                 return self._drive_type_cache[drive_key]
-            
-            # If not in cache, try to get from batch operation (shouldn't happen during normal scan)
-            logger.debug(f"Drive type not in cache for {drive_letter}, getting from PowerShell...")
-            drive_types = self._get_detailed_drive_types()
-            if drive_types is None:
-                logger.warning("Failed to get drive types from PowerShell, falling back to Unknown")
-                return "Unknown"
-            
-            # Look up the specific drive
-            drive_key = f"{drive_letter}:"
-            if drive_key in drive_types:
-                drive_type = drive_types[drive_key]
-                logger.debug(f"Detected drive type for {drive_letter}: {drive_type}")
 
-                # Update cache (use drive_key for consistency)
-                self._drive_type_cache[drive_key] = drive_type
-                self._cache_timestamp = current_time
+            # If not in cache, detect directly (shouldn't happen during normal scan)
+            logger.debug(f"Drive type not in cache for {drive_letter}, detecting directly...")
+            drive_type = self._detect_drive_type(drive_letter)
+            self._drive_type_cache[drive_key] = drive_type
+            self._cache_timestamp = current_time
+            return drive_type
 
-                return drive_type
-            else:
-                logger.debug(f"Drive {drive_letter} not found in PowerShell detection results")
-                return "Unknown"
-                
         except Exception as e:
-            logger.error(f"Error in simplified drive type detection for {drive_letter}: {e}")
+            logger.error(f"Error in drive type detection for {drive_letter}: {e}")
             return "Unknown"
     
-    def _get_detailed_drive_types(self) -> Optional[Dict[str, str]]:
-        """
-        Returns a dictionary of drive letters and their detailed types using PowerShell.
-        Differentiates between SSD and HDD for local disks.
-        """
-        
-        # Mapping for non-local disk DriveType codes
-        drive_type_mapping = {
-            0: "Unknown",
-            1: "No Root Directory",
-            2: "Removable",  # USB stick, SD card
-            4: "Network",
-            5: "CD-ROM",   # CD-ROM, DVD
-            6: "RAM-disk",
-        }
-        
-        drive_info = {}
+    # --- Drive type detection (Win32 storage IOCTLs + WMI, no PowerShell) ---
+
+    def _open_storage_handle(self, path: str, *, volume: bool = False) -> Optional[int]:
+        """Open a device/volume handle with query-only access (no admin)."""
+        flags = FILE_FLAG_BACKUP_SEMANTICS if volume else 0
+        handle = _kernel32.CreateFileW(
+            path, GENERIC_NONE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None, OPEN_EXISTING, flags | FILE_ATTRIBUTE_NORMAL, None,
+        )
+        if not handle or handle == INVALID_HANDLE_VALUE:
+            return None
+        return handle
+
+    def _device_io_control(self, handle: int, ioctl: int,
+                           query: Optional[_STORAGE_PROPERTY_QUERY] = None,
+                           out_size: int = 0) -> Optional[bytes]:
+        """Run DeviceIoControl and return the output buffer, or None on failure."""
+        in_ptr = ctypes.byref(query) if query is not None else None
+        in_size = ctypes.sizeof(query) if query is not None else 0
+        out_buf = (ctypes.c_ubyte * out_size)() if out_size else None
+        returned = ctypes.c_ulong()
+        ok = _kernel32.DeviceIoControl(
+            handle, ioctl, in_ptr, in_size,
+            out_buf, out_size if out_buf is not None else 0,
+            ctypes.byref(returned), None,
+        )
+        if not ok:
+            return None
+        return bytes(out_buf[:returned.value]) if out_buf is not None else b""
+
+    def _get_volume_disk_numbers(self, volume_path: str) -> List[int]:
+        """Map a volume path (e.g. \\\\.\\C:) to its physical disk numbers."""
+        handle = self._open_storage_handle(volume_path, volume=True)
+        if handle is None:
+            return []
         try:
-            # Get the directory where this script is located
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            ps_script = os.path.join(script_dir, "get_drive_types.ps1")
-            
-            # Execute the PowerShell script
-            command = f'powershell -ExecutionPolicy Bypass -File "{ps_script}"'
-            result = subprocess.run(command, capture_output=True, text=True, check=True, shell=True)
-            
-            # Parse the JSON output
-            disks = json.loads(result.stdout)
+            out = self._device_io_control(handle, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, None, 4096)
+            if not out or len(out) < 4:
+                return []
+            count = struct.unpack_from("<I", out, 0)[0]
+            disk_numbers = []
+            for i in range(count):
+                # VOLUME_DISK_EXTENTS: DWORD count @0, then DISK_EXTENT[]. First extent
+                # sits at offset 8 (4-byte header + 4-byte padding); DISK_EXTENT is 24 bytes
+                # (DiskNumber @0, LARGE_INTEGER StartingOffset @8, ExtentLength @16).
+                off = 8 + i * 24
+                if off + 4 > len(out):
+                    break
+                disk_numbers.append(struct.unpack_from("<I", out, off)[0])
+            return disk_numbers
+        finally:
+            _kernel32.CloseHandle(handle)
 
-            if isinstance(disks, dict):
-                disks = [disks] # Handle case with only one drive
+    def _get_disk_numbers_wmi(self, drive_letter: str) -> List[int]:
+        """Fallback letter→disk mapping via MSFT_Partition (root\\Microsoft\\Windows\\Storage)."""
+        try:
+            import win32com.client
+            locator = win32com.client.Dispatch("WbemScripting.SWbemLocator")
+            service = locator.ConnectServer(".", r"root\Microsoft\Windows\Storage")
+            query = f"SELECT DiskNumber FROM MSFT_Partition WHERE DriveLetter='{drive_letter}'"
+            return [int(part.DiskNumber) for part in service.ExecQuery(query)]
+        except Exception as e:
+            logger.debug(f"WMI MSFT_Partition query failed for {drive_letter}: {e}")
+            return []
 
-            # Process the combined data
-            for disk in disks:
-                device_id = disk['DeviceID']
-                drive_type_code = disk['DriveType']
-                
-                # If it's a local disk (Type 3), use the specific MediaType
-                if drive_type_code == 3:
-                    drive_info[device_id] = disk['MediaType']
-                # Otherwise, use the general mapping
-                else:
-                    drive_info[device_id] = drive_type_mapping.get(drive_type_code, "Unknown")
-            
-            logger.debug(f"PowerShell drive detection results: {drive_info}")
+    def _get_disk_numbers_for_letter(self, drive_letter: str) -> List[int]:
+        """Return the physical disk number(s) backing a drive letter."""
+        letter = drive_letter.rstrip(':').upper()
+        if len(letter) != 1 or not ('A' <= letter <= 'Z'):
+            return []
+        disk_numbers = self._get_volume_disk_numbers(f"\\\\.\\{letter}:")
+        if not disk_numbers:
+            disk_numbers = self._get_disk_numbers_wmi(letter)
+        return disk_numbers
+
+    def _query_seek_penalty(self, disk_number: int) -> Optional[bool]:
+        """True=HDD, False=SSD, None=unsupported, via StorageDeviceSeekPenaltyProperty."""
+        handle = self._open_storage_handle(f"\\\\.\\PhysicalDrive{disk_number}")
+        if handle is None:
+            return None
+        try:
+            query = _STORAGE_PROPERTY_QUERY()
+            query.PropertyId = STORAGE_DEVICE_SEEK_PENALTY_PROPERTY
+            query.QueryType = PROPERTY_STANDARD_QUERY
+            out = self._device_io_control(handle, IOCTL_STORAGE_QUERY_PROPERTY, query, 32)
+            if out is None or len(out) < 9:
+                return None
+            # DEVICE_SEEK_PENALTY_DESCRIPTOR.IncursSeekPenalty (BOOLEAN) @ offset 8
+            return bool(out[8])
+        finally:
+            _kernel32.CloseHandle(handle)
+
+    def _query_bus_type(self, disk_number: int) -> Optional[int]:
+        """Return the STORAGE_BUS_TYPE of a physical disk, or None."""
+        handle = self._open_storage_handle(f"\\\\.\\PhysicalDrive{disk_number}")
+        if handle is None:
+            return None
+        try:
+            query = _STORAGE_PROPERTY_QUERY()
+            query.PropertyId = STORAGE_DEVICE_PROPERTY
+            query.QueryType = PROPERTY_STANDARD_QUERY
+            out = self._device_io_control(handle, IOCTL_STORAGE_QUERY_PROPERTY, query, 512)
+            if out is None or len(out) < 32:
+                return None
+            # STORAGE_DEVICE_DESCRIPTOR.BusType is a 4-byte enum @ offset 28
+            return struct.unpack_from("<I", out, 28)[0]
+        finally:
+            _kernel32.CloseHandle(handle)
+
+    def _get_media_type_wmi(self, disk_number: int) -> Optional[str]:
+        """Return 'SSD'/'HDD'/'SCM' from MSFT_PhysicalDisk.MediaType, or None."""
+        try:
+            import win32com.client
+            locator = win32com.client.Dispatch("WbemScripting.SWbemLocator")
+            service = locator.ConnectServer(".", r"root\Microsoft\Windows\Storage")
+            for disk in service.ExecQuery("SELECT DeviceId, MediaType FROM MSFT_PhysicalDisk"):
+                try:
+                    if int(disk.DeviceId) == int(disk_number):
+                        return WMI_MEDIA_TYPE.get(int(disk.MediaType))
+                except (ValueError, TypeError):
+                    continue
+        except Exception as e:
+            logger.debug(f"WMI MSFT_PhysicalDisk query failed for disk {disk_number}: {e}")
+        return None
+
+    def _get_friendly_name_wmi(self, disk_number: int) -> Optional[str]:
+        """Return the MSFT_PhysicalDisk.FriendlyName for a disk, or None."""
+        try:
+            import win32com.client
+            locator = win32com.client.Dispatch("WbemScripting.SWbemLocator")
+            service = locator.ConnectServer(".", r"root\Microsoft\Windows\Storage")
+            for disk in service.ExecQuery("SELECT DeviceId, FriendlyName FROM MSFT_PhysicalDisk"):
+                try:
+                    if int(disk.DeviceId) == int(disk_number):
+                        return disk.FriendlyName or None
+                except (ValueError, TypeError):
+                    continue
+        except Exception as e:
+            logger.debug(f"WMI MSFT_PhysicalDisk FriendlyName query failed for disk {disk_number}: {e}")
+        return None
+
+    @staticmethod
+    def _classify_by_name(name: Optional[str]) -> Optional[str]:
+        """Best-effort SSD/HDD classification from a disk model/friendly name.
+
+        Last-resort heuristic used only when hardware signals (seek penalty,
+        MediaType) are unavailable — typically USB/SCSI enclosures that hide the
+        medium. Returns None when the name is ambiguous.
+        """
+        s = (name or "").upper().strip()
+        if not s:
+            return None
+        ssd = ("NVME", "SSD", "SOLID STATE", "M.2", "FLASH", "SAMSUNG",
+               "MICRON", "SABRENT", "CRUCIAL", "KINGSTON", "WDS", "WD_BLACK")
+        hdd = ("HDD", "HARD DISK", "WDC", "TOSHIBA", "SEAGATE", "GAME DRIVE",
+               "BARRACUDA", "IRONWOLF", "EXOS", "ULTRASTAR", "EXPANSION",
+               "ROTATIONAL", "SPINNING")
+        if any(m in s for m in ssd):
+            return "SSD"
+        if any(m in s for m in hdd) or s.startswith("ST"):
+            return "HDD"
+        return None
+
+    def _detect_fixed_drive_type(self, drive_letter: str) -> str:
+        """Distinguish SSD vs HDD for a DRIVE_FIXED letter via the fallback chain."""
+        disk_numbers = self._get_disk_numbers_for_letter(drive_letter)
+
+        for disk_number in disk_numbers:
+            penalty = self._query_seek_penalty(disk_number)
+            if penalty is True:
+                return "HDD"
+            if penalty is False:
+                return "SSD"
+
+        for disk_number in disk_numbers:
+            media_type = self._get_media_type_wmi(disk_number)
+            if media_type in ("SSD", "HDD"):
+                return media_type
+
+        for disk_number in disk_numbers:
+            if self._query_bus_type(disk_number) == BUS_TYPE_NVME:
+                return "SSD"
+
+        # Hardware signals unavailable (USB/SCSI enclosures): fall back to the
+        # model/friendly-name heuristic.
+        for disk_number in disk_numbers:
+            name_type = self._classify_by_name(self._get_friendly_name_wmi(disk_number))
+            if name_type is not None:
+                return name_type
+
+        return "Unknown"
+
+    def _detect_drive_type(self, drive_letter: str) -> str:
+        """Classify a drive using GetDriveTypeW + the SSD/HDD chain."""
+        letter = drive_letter.rstrip(':').upper()
+        try:
+            coarse = _kernel32.GetDriveTypeW(f"{letter}:\\")
+        except Exception:
+            coarse = 0
+
+        if coarse == 2:   # DRIVE_REMOVABLE
+            return "Removable"
+        if coarse == 4:   # DRIVE_REMOTE
+            return "Network"
+        if coarse == 5:   # DRIVE_CDROM
+            return "CD-ROM"
+        if coarse == 6:   # DRIVE_RAMDISK
+            return "RAM-disk"
+        if coarse != 3:   # DRIVE_FIXED
+            return "Unknown"
+
+        return self._detect_fixed_drive_type(letter)
+
+    def _get_detailed_drive_types(self) -> Optional[Dict[str, str]]:
+        """Return {letter_with_colon: type} for all present logical drives."""
+        try:
+            bitmask = _kernel32.GetLogicalDrives()
+            if not bitmask:
+                return None
+            drive_info = {}
+            for i in range(26):
+                if bitmask & (1 << i):
+                    letter = chr(ord('A') + i)
+                    drive_info[f"{letter}:"] = self._detect_drive_type(letter)
+            logger.debug(f"Drive detection results: {drive_info}")
             return drive_info
-            
-        except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError) as e:
-            logger.error(f"Error in PowerShell drive type detection: {e}")
+        except Exception as e:
+            logger.error(f"Error in drive type detection: {e}")
             return None
     
     def _get_volume_info(self, drive_path: Path) -> Dict[str, Any]:

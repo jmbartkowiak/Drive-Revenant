@@ -69,7 +69,6 @@ class Scheduler:
         self._drive_timing: Dict[str, DriveTimingState] = {}
 
         # Global spacing tracking
-        self._last_global_read_at = 0.0
         self._last_global_write_at = 0.0
 
         # Grid settings from config
@@ -79,11 +78,38 @@ class Scheduler:
 
         logger.info(f"Scheduler initialized: grid={self.grid_ms}ms, read_spacing={self.min_read_spacing_ms}ms, write_spacing={self.min_write_spacing_ms}ms")
 
+    @property
+    def version(self) -> int:
+        """Monotonic version counter for change detection."""
+        with self._lock:
+            return self._version
+
     def get_timing_state(self, drive_letter: str) -> Optional[DriveTimingState]:
         """Get timing state for a drive."""
         with self._lock:
             return self._drive_timing.get(drive_letter)
-    
+
+    def clear_next_due(self, drive_letter: str) -> None:
+        """Clear a drive's next-due time under the scheduler lock."""
+        with self._lock:
+            timing = self._drive_timing.get(drive_letter)
+            if timing is not None:
+                timing.next_due_at = None
+                self._version += 1
+
+    def clear_all(self) -> None:
+        """Clear all drive timing state and reset the snapshot (thread-safe)."""
+        with self._lock:
+            self._drive_timing.clear()
+            self._version = 0
+            self._snapshot = None
+
+    def remove_drive(self, drive_letter: str) -> None:
+        """Remove a drive's timing state under the scheduler lock."""
+        with self._lock:
+            self._drive_timing.pop(drive_letter, None)
+            self._version += 1
+
     def set_drive_config(self, drive_letter: str, enabled: bool, interval_sec: int, 
                          drive_type: str, ping_dir: Optional[str]):
         """Update drive configuration in scheduler."""
@@ -183,16 +209,16 @@ class Scheduler:
                 failure_count=failure_count,
                 quarantine_release_at=quarantine_release_at,
                 type=type,
-            consecutive_tick_failures=consecutive_tick_failures,
-            last_tick_attempts=last_tick_attempts,
-            tick_counter=tick_counter
-        )
-        
-        # Update quarantine count if provided
-        if quarantine_count is not None:
-            timing.quarantine_count = quarantine_count
+                consecutive_tick_failures=consecutive_tick_failures,
+                last_tick_attempts=last_tick_attempts,
+                tick_counter=tick_counter
+            )
 
-            # Update snapshot
+            # Update quarantine count if provided
+            if quarantine_count is not None:
+                timing.quarantine_count = quarantine_count
+
+            # Rebuild the immutable snapshot to reflect the latest drive state
             if self._snapshot is None:
                 self._snapshot = StatusSnapshot(
                     generated_at=self.clock.monotonic(),
@@ -200,7 +226,6 @@ class Scheduler:
                     drives={}
                 )
 
-            # Create new drives dict (immutable)
             new_drives = dict(self._snapshot.drives)
             new_drives[drive_letter] = drive_snapshot
 
@@ -212,16 +237,24 @@ class Scheduler:
 
     def plan_next_operation(self, drive_letter: str, base_interval_sec: float,
                            last_ok_at: Optional[float] = None) -> float:
-        """Plan next operation time with global spacing and deterministic jitter."""
+        """Plan the next operation time with deterministic jitter and spacing.
+
+        This scheduler-level planner is kept for tests and previews; production
+        planning goes through JitterPlanner. Results are deterministic for a
+        given install, drive, and cycle.
+        """
         now = self.clock.monotonic()
 
         # Compute cycle anchor for deterministic jitter
+        if base_interval_sec <= 0:
+            base_interval_sec = 1.0
         cycle_id = int(now // base_interval_sec) if last_ok_at else 0
 
         # Deterministic jitter using stable seed
         jitter_seed = f"{self.config.install_id}:{drive_letter}:{cycle_id}".encode()
         jitter_hash = hashlib.blake2s(jitter_seed).digest()
-        jitter_ms = int.from_bytes(jitter_hash[:4], "little") % (self.config.jitter_sec * 1000)
+        jitter_window_ms = max(1, self.config.jitter_sec * 1000)
+        jitter_ms = int.from_bytes(jitter_hash[:4], "little") % jitter_window_ms
         jitter_offset = jitter_ms / 1000.0
 
         # Pre-candidate time
@@ -231,32 +264,25 @@ class Scheduler:
             candidate = now + jitter_offset
 
         # Apply global spacing constraints
-        candidate = self._apply_global_spacing(candidate, drive_letter)
+        candidate = self._apply_global_spacing(candidate)
 
         # Align to grid
         candidate = self._align_to_grid(candidate)
 
         return candidate
 
-    def _apply_global_spacing(self, candidate: float, drive_letter: str) -> float:
-        """Apply global spacing constraints to candidate time."""
+    def _apply_global_spacing(self, candidate: float) -> float:
+        """Push a candidate past the previous planned operation plus spacing.
+
+        Uses the conservative (write) spacing because the scheduler-level planner
+        does not know the operation type up front. Spacing only applies while the
+        previous operation was planned within one spacing window of now.
+        """
         now = self.clock.monotonic()
-
-        # For now, simple implementation - in full version would check operation type
-        # and enforce min spacing between same-type operations globally
-
-        # Update global timestamps (simplified)
-        if "read" in drive_letter.lower():  # Simplified check
-            min_spacing = self.min_read_spacing_ms / 1000.0
-            if now - self._last_global_read_at < min_spacing:
-                candidate = max(candidate, self._last_global_read_at + min_spacing)
-            self._last_global_read_at = candidate
-        else:  # Assume write
-            min_spacing = self.min_write_spacing_ms / 1000.0
-            if now - self._last_global_write_at < min_spacing:
-                candidate = max(candidate, self._last_global_write_at + min_spacing)
-            self._last_global_write_at = candidate
-
+        min_spacing = self.min_write_spacing_ms / 1000.0
+        if now - self._last_global_write_at < min_spacing:
+            candidate = max(candidate, self._last_global_write_at + min_spacing)
+        self._last_global_write_at = candidate
         return candidate
 
     def _align_to_grid(self, time_value: float) -> float:
@@ -379,10 +405,11 @@ class JitterPlanner:
         return int.from_bytes(h.digest()[:8], "little")
     
     def _get_effective_interval(self, drive_state: DriveState) -> Tuple[float, Optional[str]]:
-        """Get effective interval with HDD guard applied and update drive config.
+        """Get the effective interval with the HDD guard applied.
         
         Returns (effective_interval, status_reason) where status_reason is None, "HDD_CAPPED", or "CLAMPED".
-        Also updates drive_state.config.interval to reflect the effective interval.
+        Does not mutate drive_state.config.interval; the effective interval is
+        returned separately.
         """
         user_interval = drive_state.config.interval
         min_interval = max(user_interval, self.config.interval_min_sec)
@@ -404,10 +431,6 @@ class JitterPlanner:
             effective = min_interval
             if min_interval > user_interval:
                 status_reason = "CLAMPED"
-        
-        # Update the drive config to reflect the effective interval
-        # This ensures the GUI and all other components see the actual interval being used
-        drive_state.config.interval = int(effective)
         
         return effective, status_reason
     
@@ -436,35 +459,6 @@ class JitterPlanner:
         """Determine if drive is HDD."""
         return drive_state.config.type.upper() == "HDD"
     
-    def _get_hdd_candidate_offsets(self, jitter_window: float) -> List[float]:
-        """Get candidate offsets for HDDs (earlier-first with late slack)."""
-        candidates = []
-        
-        # Earlier-only offsets: 0, -0.5, -1.0, ...
-        for i in range(int(jitter_window / self.grid_sec) + 1):
-            offset = -i * self.grid_sec
-            if abs(offset) <= jitter_window:
-                candidates.append(offset)
-        
-        # Add tiny late slack if within deadline margin
-        if self.deadline_margin_sec >= self.grid_sec:
-            candidates.append(self.grid_sec)
-        
-        return candidates
-    
-    def _get_standard_candidate_offsets(self, jitter_window: float) -> List[float]:
-        """Get candidate offsets for non-HDD drives (balanced)."""
-        candidates = [0.0]  # Start with nominal
-        
-        # Balanced offsets: +0.5, -0.5, +1.0, -1.0, ...
-        for i in range(1, int(jitter_window / self.grid_sec) + 1):
-            for sign in (+1, -1):
-                offset = sign * i * self.grid_sec
-                if abs(offset) <= jitter_window:
-                    candidates.append(offset)
-        
-        return candidates
-    
     def _check_spacing_constraints(self, candidate_time: float, operation_type: OperationType, 
                                  scheduled_ops: List[ScheduledOperation]) -> bool:
         """Check if candidate_time satisfies spacing constraints."""
@@ -482,117 +476,6 @@ class JitterPlanner:
                     return False
         
         return True
-    
-    def _pack_same_tick_operations(self, drives_at_tick: List[DriveState],
-                                 nominal_time: float, scheduled_ops: List[ScheduledOperation]) -> List[ScheduledOperation]:
-        """Pack multiple drives that have the same canonical tick time."""
-        if not drives_at_tick:
-            return []
-
-        # Separate writes and reads
-        writes = [d for d in drives_at_tick if d.config.type in ["HDD", "RAM-disk"] or
-                 (d.config.type == "Unknown" and not self.config.treat_unknown_as_ssd)]
-        reads = [d for d in drives_at_tick if d not in writes]
-
-        new_ops = []
-        placed = []  # (drive_letter, offset, operation_type)
-
-        # Get current tie-breaking information
-        current_date = datetime.now().date()
-        daily_seed = self._compute_daily_seed(current_date)
-        tie_epoch = current_date.strftime("%Y-%m-%d")
-
-        # Place writes first
-        if writes:
-            # Sort by anchor priority: slower first, then HDD over SSD, then by rank
-            def anchor_sort_key(drive):
-                speed_key = float('inf') if drive.measured_speed is None else drive.measured_speed
-                type_key = 0 if drive.config.type == "HDD" else 1
-                rank_key = self._compute_drive_rank(self._get_drive_identity(drive))
-                return (speed_key, type_key, rank_key)
-
-            writes_sorted = sorted(writes, key=anchor_sort_key)
-            anchor = writes_sorted[0]
-
-            # Place anchor at 0 offset
-            anchor_time = nominal_time
-            if self._check_spacing_constraints(anchor_time, OperationType.WRITE, scheduled_ops + new_ops):
-                # Add telemetry for same-tick packing
-                anchor_rank = self._compute_drive_rank(self._get_drive_identity(anchor))
-
-                new_ops.append(ScheduledOperation(
-                    drive_letter=anchor.letter,
-                    operation_time=anchor_time,
-                    operation_type=OperationType.WRITE,
-                    offset_ms=0.0,
-                    jitter_reason="in_window",
-                    pack_size=len(drives_at_tick),
-                    tie_epoch=tie_epoch,
-                    tie_rank=anchor_rank,
-                    tie_seed64=daily_seed.hex()
-                ))
-                placed.append((anchor.letter, 0.0, OperationType.WRITE))
-
-            # Place remaining writes at ±1.0s, ±2.0s, ...
-            for i, drive in enumerate(writes_sorted[1:], start=1):
-                for sign in (+1, -1):
-                    offset = sign * 1.0 * i
-                    if abs(offset) <= self.jitter_sec:
-                        candidate_time = nominal_time + offset
-                        if self._check_spacing_constraints(candidate_time, OperationType.WRITE, scheduled_ops + new_ops):
-                            # Add telemetry for same-tick packing
-                            drive_rank = self._compute_drive_rank(self._get_drive_identity(drive))
-
-                            new_ops.append(ScheduledOperation(
-                                drive_letter=drive.letter,
-                                operation_time=candidate_time,
-                                operation_type=OperationType.WRITE,
-                                offset_ms=offset * 1000,
-                                jitter_reason="in_window",
-                                pack_size=len(drives_at_tick),
-                                tie_epoch=tie_epoch,
-                                tie_rank=drive_rank,
-                                tie_seed64=daily_seed.hex()
-                            ))
-                            placed.append((drive.letter, offset, OperationType.WRITE))
-                            break
-
-        # Place reads at 0.5s, -0.5s, 1.5s, -1.5s, ...
-        read_slots = [0.5] + [s * 0.5 for k in range(1, 20) for s in (+(2*k+1), -(2*k+1))]
-
-        # Sort reads by rank
-        reads_sorted = sorted(reads, key=lambda d: self._compute_drive_rank(self._get_drive_identity(d)))
-
-        for drive in reads_sorted:
-            for offset in read_slots:
-                if abs(offset) <= self.jitter_sec:
-                    candidate_time = nominal_time + offset
-                    if self._check_spacing_constraints(candidate_time, OperationType.READ, scheduled_ops + new_ops):
-                        # Add telemetry for same-tick packing
-                        drive_rank = self._compute_drive_rank(self._get_drive_identity(drive))
-
-                        new_ops.append(ScheduledOperation(
-                            drive_letter=drive.letter,
-                            operation_time=candidate_time,
-                            operation_type=OperationType.READ,
-                            offset_ms=offset * 1000,
-                            jitter_reason="in_window",
-                            pack_size=len(drives_at_tick),
-                            tie_epoch=tie_epoch,
-                            tie_rank=drive_rank,
-                            tie_seed64=daily_seed.hex()
-                        ))
-                        placed.append((drive.letter, offset, OperationType.READ))
-                        break
-
-        # Mark HDD guard telemetry on drive states (for logging later)
-        for letter, offset, op_type in placed:
-            ds = next((d for d in drives_at_tick if d.letter == letter), None)
-            if ds and ds.config.type == "HDD":
-                if offset > 0 and offset <= self.config.deadline_margin_sec:
-                    ds.late_slack_used = True
-        
-        return new_ops
     
     def plan_next_operation(self, drive_state: DriveState, current_time: float, 
                           scheduled_ops: List[ScheduledOperation]) -> Optional[ScheduledOperation]:
@@ -727,7 +610,7 @@ class JitterPlanner:
 class CoreEngine:
     """Main scheduling engine for Drive Revenant."""
 
-    def __init__(self, config: AppConfig, io_manager=None, config_manager=None, logging_manager=None):
+    def __init__(self, config: AppConfig, io_manager=None, config_manager=None, logging_manager=None, clock: Optional[Clock] = None):
         self.config = config
         self.io_manager = io_manager
         self.config_manager = config_manager
@@ -735,7 +618,7 @@ class CoreEngine:
         self.jitter_planner = JitterPlanner(config)
 
         # New centralized scheduler
-        self.scheduler = Scheduler(config)
+        self.scheduler = Scheduler(config, clock)
         logger.info(f"CoreEngine initialized with scheduler: grid={config.scheduler_grid_ms}ms, "
                    f"read_spacing={config.scheduler_min_read_spacing_ms}ms, "
                    f"write_spacing={config.scheduler_min_write_spacing_ms}ms")
@@ -845,13 +728,13 @@ class CoreEngine:
                 next_due_at = existing_timing.next_due_at if existing_timing else None
                 if next_due_at is None and drive_state.enabled and drive_state.status == DriveStatus.ACTIVE:
                     current_time = self.scheduler.clock.monotonic()
-                    next_due_at = current_time + drive_state.config.interval
+                    next_due_at = current_time + effective_interval
                 
                 self.scheduler.update_drive_state(
                     drive_letter=letter,
                     state="normal",
                     next_due_at=next_due_at,
-                    interval_sec=drive_state.config.interval,  # This now contains the effective interval
+                    interval_sec=drive_state.config.interval,  # User-configured interval
                     effective_interval_sec=effective_interval,
                     type=drive_state.config.type,
                     status_reason=status_reason
@@ -905,8 +788,8 @@ class CoreEngine:
         for letter, days, q_count in stale_drives:
             logger.warning(f"Removing permanently failed drive {letter} (not seen {days:.1f}d, quarantine level {q_count})")
             del self.config.per_drive[letter]
-            # Also remove from scheduler to clean up GUI
-            # (Note: Scheduler's get_all_drive_states will no longer return this drive)
+            # Also remove from scheduler so it stops being pinged and shown.
+            self.scheduler.remove_drive(letter)
         
         if stale_drives:
             logger.info(f"Removed {len(stale_drives)} permanently failed drive(s) from configuration")
@@ -959,7 +842,7 @@ class CoreEngine:
             next_due_at = None
             if drive_state.enabled and drive_state.status == DriveStatus.ACTIVE:
                 current_time = self.scheduler.clock.monotonic()
-                next_due_at = current_time + drive_state.config.interval
+                next_due_at = current_time + effective_interval
             
             # DUAL-WRITE Phase 2: Set config and status FIRST for proper synchronization
             self.scheduler.set_drive_config(
@@ -980,7 +863,7 @@ class CoreEngine:
                 drive_letter=letter,
                 state=status_str,
                 next_due_at=next_due_at,
-                interval_sec=drive_state.config.interval,  # Use the updated interval after effective calculation
+                interval_sec=drive_state.config.interval,  # User-configured interval
                 effective_interval_sec=effective_interval,
                 failure_count=0,
                 type=drive_config.type,
@@ -1308,9 +1191,11 @@ class CoreEngine:
             result = ctypes.windll.user32.GetLastInputInfo(ctypes.byref(last_input))
             
             if result:
-                # Get current tick count
+                # Get current tick count. Both are 32-bit DWORDs that wrap at
+                # ~49.7 days, so mask the difference to unsigned to stay correct
+                # across a wraparound.
                 current_tick = ctypes.windll.kernel32.GetTickCount()
-                idle_time_ms = current_tick - last_input.dwTime
+                idle_time_ms = (current_tick - last_input.dwTime) & 0xFFFFFFFF
                 idle_time_min = idle_time_ms / (1000 * 60)  # Convert to minutes
                 
                 return idle_time_min >= self.config.idle_pause_min
@@ -1362,75 +1247,35 @@ class CoreEngine:
                 ]
             return
 
-        # Group drives by canonical tick time (only for drives needing new operations)
-        tick_groups: Dict[float, List[DriveState]] = {}
-
-        # PHASE 3: Read from scheduler
+        # Plan each drive that needs a new operation. plan_next_operation already
+        # enforces spacing against the existing schedule, so no manual tick packing
+        # is required (and the previous tick grouping scheduled packed drives at
+        # "now" instead of their canonical interval).
+        new_operations = []
         for letter, timing in self.scheduler.get_all_drive_states().items():
             if not timing.enabled:
                 continue
-
-            # Skip quarantined drives
             if timing.status == DriveStatus.QUARANTINE:
                 continue
-            
-            # Skip drives that already have FUTURE scheduled operations
-            if timing.next_due_at is not None and timing.next_due_at > current_time:
-                logger.debug(f"Skipping {letter} (next_due_at={timing.next_due_at:.2f} > now={current_time:.2f})")
+            if timing.status == DriveStatus.PAUSED:
                 continue
-            
-            # Plan for drives with None OR past-due next_due_at
-            logger.debug(f"Planning {letter} (next_due_at={timing.next_due_at}, needs planning)")
-            
-            # Build DriveState for compatibility with jitter_planner
+            # Skip drives that already have a future scheduled operation.
+            if timing.next_due_at is not None and timing.next_due_at > current_time:
+                continue
+
             drive_state = self._build_drive_state_from_scheduler(letter)
             if not drive_state:
                 continue
-            
-            # All drives without next_due need operations planned
-            canonical_time = current_time
-            
-            # Snap to grid
-            grid_time = round(canonical_time / self.jitter_planner.grid_sec) * self.jitter_planner.grid_sec
-            
-            if grid_time not in tick_groups:
-                tick_groups[grid_time] = []
-            tick_groups[grid_time].append(drive_state)
-        
-        # Plan operations for each tick group
-        new_operations = []
-        for tick_time, drives in tick_groups.items():
-            if len(drives) == 1:
-                # Single drive - use standard planning
-                drive = drives[0]
-                timing_state = self.scheduler.get_timing_state(drive.letter)
-                next_due = timing_state.next_due_at if timing_state else None
-                logger.debug(f"Planning operation for drive {drive.letter} (next_due={next_due})")
-                op = self.jitter_planner.plan_next_operation(drive, current_time, self.scheduled_operations + new_operations)
-                if op:
-                    new_operations.append(op)
-                    logger.debug(f"Planned operation for {drive.letter} at {op.operation_time:.2f}")
-                else:
-                    logger.warning(f"Failed to plan operation for {drive.letter}")
-            else:
-                # Multiple drives - use packing
-                logger.debug(f"Planning packed operations for {len(drives)} drives at tick {tick_time}")
-                packed_ops = self.jitter_planner._pack_same_tick_operations(drives, tick_time, self.scheduled_operations + new_operations)
-                new_operations.extend(packed_ops)
 
-                # Log same-tick packing event
-                if self.logging_manager and packed_ops:
-                    self.logging_manager.log_scheduler_event(
-                        "same_tick_packing",
-                        {
-                            "tick_time": tick_time,
-                            "pack_size": len(drives),
-                            "drives": [d.letter for d in drives]
-                        },
-                        current_time
-                    )
-        
-        # Add new operations to schedule
+            op = self.jitter_planner.plan_next_operation(
+                drive_state, current_time, self.scheduled_operations + new_operations
+            )
+            if op:
+                new_operations.append(op)
+                logger.debug(f"Planned operation for {letter} at {op.operation_time:.2f}")
+            else:
+                logger.warning(f"Failed to plan operation for {letter}")
+
         self.scheduled_operations.extend(new_operations)
 
         # Update next_due for each drive based on planned operations
@@ -1469,129 +1314,32 @@ class CoreEngine:
         self.scheduled_operations.sort(key=lambda op: op.operation_time)
     
     def _generate_upcoming_preview(self, current_time: float, target_count: int = 5) -> List[Dict[str, Any]]:
-        """Generate preview of upcoming operations using lightweight simulation.
-        
-        Simulates the next few planning cycles without committing operations to self.scheduled_operations.
-        Uses the same jitter/packing/spacing rules as the real scheduler.
-        
-        Args:
-            current_time: Current monotonic time
-            target_count: Target number of operations to generate
-            
-        Returns:
-            List of preview operations: [{"drive": "G:", "time": 12345.67, "is_preview": True}, ...]
+        """Return the next few scheduled operations for the status bar.
+
+        Derived directly from the live schedule and next_due_at values instead of
+        an O(n^2) simulation, keeping the status-bar refresh cheap.
         """
-        # PHASE 3: Read from scheduler
-        all_timing_states = self.scheduler.get_all_drive_states()
-        if not all_timing_states:
-            return []
-        
-        # Calculate preview horizon
-        preview_horizon = self.config.hdd_max_gap_sec * 5 + 1
-        
-        # Get currently scheduled operations (real ones)
-        real_operations = list(self.scheduled_operations)
-        preview_operations = []
-        
-        # Create a copy of drive states for simulation
-        sim_drive_states = {}
-        for letter, timing in all_timing_states.items():
-            if timing.enabled and timing.status not in [DriveStatus.PAUSED, DriveStatus.QUARANTINE]:
-                drive_state = self._build_drive_state_from_scheduler(letter)
-                if drive_state:
-                    sim_drive_states[letter] = drive_state
-        
-        if not sim_drive_states:
-            return []
-        
-        # Simulate planning cycles until we have enough operations or hit the time horizon
-        sim_time = current_time
-        max_sim_time = current_time + preview_horizon
-        
-        # Track the last scheduled time for each drive to prevent rapid rescheduling
-        drive_last_scheduled = {}
-        
-        # Initialize with real scheduled operations
-        for op in real_operations:
-            drive_last_scheduled[op.drive_letter] = op.operation_time
-        
-        while len(preview_operations) < target_count and sim_time < max_sim_time:
-            # Find drives that need operations planned
-            drives_needing_ops = []
-            for letter, drive_state in sim_drive_states.items():
-                # Check if this drive already has a scheduled operation in the preview window
-                has_future_op = False
-                
-                # Check real_operations (ScheduledOperation objects)
-                for op in real_operations:
-                    if op.drive_letter == letter and op.operation_time > sim_time:
-                        has_future_op = True
-                        break
-                
-                # Check preview_operations (dict objects)
-                if not has_future_op:
-                    for op in preview_operations:
-                        if op["drive"] == letter and op["time"] > sim_time:
-                            has_future_op = True
-                            break
-                
-                # Check if drive was recently scheduled (within its interval)
-                if not has_future_op and letter in drive_last_scheduled:
-                    last_scheduled_time = drive_last_scheduled[letter]
-                    min_interval = drive_state.config.interval * 0.9  # 90% of interval as minimum
-                    if sim_time - last_scheduled_time < min_interval:
-                        has_future_op = True  # Skip this drive for now
-                
-                if not has_future_op:
-                    drives_needing_ops.append(drive_state)
-            
-            if not drives_needing_ops:
-                # All drives have operations planned, advance time
-                sim_time += 1.0
+        upcoming: List[Dict[str, Any]] = []
+        seen = set()
+
+        # Real scheduled operations (already time-sorted by _plan_operations)
+        for op in self.scheduled_operations:
+            if op.operation_time >= current_time and op.drive_letter not in seen:
+                upcoming.append({"drive": op.drive_letter, "time": op.operation_time, "is_preview": False})
+                seen.add(op.drive_letter)
+
+        # Drives that have a next_due_at but no live scheduled operation yet
+        for letter, timing in self.scheduler.get_all_drive_states().items():
+            if letter in seen or not timing.enabled:
                 continue
-            
-            # Plan operations for drives that need them
-            for drive_state in drives_needing_ops:
-                # Use existing jitter planner to maintain consistency
-                all_scheduled_ops = real_operations + [ScheduledOperation(
-                    drive_letter=op["drive"],
-                    operation_time=op["time"],
-                    operation_type=OperationType.READ,  # Default for preview
-                    offset_ms=0,
-                    jitter_reason="preview",
-                    pack_size=1,
-                    tie_epoch="",
-                    tie_rank=0,
-                    tie_seed64=""
-                ) for op in preview_operations]
-                
-                preview_op = self.jitter_planner.plan_next_operation(drive_state, sim_time, all_scheduled_ops)
-                if preview_op and preview_op.operation_time <= max_sim_time:
-                    preview_operations.append({
-                        "drive": preview_op.drive_letter,
-                        "time": preview_op.operation_time,
-                        "is_preview": True
-                    })
-                    # Track when this drive was last scheduled
-                    drive_last_scheduled[preview_op.drive_letter] = preview_op.operation_time
-            
-            # Advance simulation time
-            sim_time += 0.5
-        
-        # Sort all operations by time
-        all_ops = []
-        for op in real_operations:
-            all_ops.append({
-                "drive": op.drive_letter,
-                "time": op.operation_time,
-                "is_preview": False
-            })
-        all_ops.extend(preview_operations)
-        all_ops.sort(key=lambda x: x["time"])
-        
-        # Return first target_count operations
-        return all_ops[:target_count]
-    
+            if timing.status in (DriveStatus.PAUSED, DriveStatus.QUARANTINE):
+                continue
+            if timing.next_due_at is not None and timing.next_due_at >= current_time:
+                upcoming.append({"drive": letter, "time": timing.next_due_at, "is_preview": True})
+                seen.add(letter)
+
+        upcoming.sort(key=lambda x: x["time"])
+        return upcoming[:target_count]
     def _execute_due_operations(self, current_time: float):
         """Execute operations that are due."""
         due_operations = []
@@ -1602,14 +1350,7 @@ class CoreEngine:
         
         # Clear next_due_at for each drive so they can be re-planned after execution
         for op in due_operations:
-            # Direct update to timing state (cleaner than full update_drive_state call)
-            timing = self.scheduler.get_timing_state(op.drive_letter)
-            if timing:
-                old_next_due = timing.next_due_at
-                timing.next_due_at = None
-                logger.info(f"COUNTDOWN FIX: Cleared next_due_at for {op.drive_letter} (was {old_next_due}, now None) to enable re-planning")
-            else:
-                logger.error(f"COUNTDOWN FIX: No timing state found for {op.drive_letter} - cannot clear next_due_at!")
+            self.scheduler.clear_next_due(op.drive_letter)
         
         # Execute each due operation
         for op in due_operations:
@@ -1816,7 +1557,8 @@ class CoreEngine:
             "drives": {},
             "next_operation": None,
             "policy_reasons": self.policy_state.reasons,
-            "upcoming_operations": []
+            "upcoming_operations": [],
+            "snapshot_version": self.scheduler.version
         }
 
         # Next operation
@@ -1846,6 +1588,10 @@ class CoreEngine:
         snapshot["upcoming_operations"] = self._generate_upcoming_preview(current_time, target_count=5)
 
         return snapshot
+
+    def get_status_snapshot(self) -> Dict[str, Any]:
+        """Alias for get_full_status_snapshot (backward compatibility)."""
+        return self.get_full_status_snapshot()
 
     def _should_emit_status_update(self, current_time: float) -> bool:
         """Check if status update should be emitted (either time-based or state changed)."""
@@ -1925,6 +1671,7 @@ class CoreEngine:
             "status": drive_state.status.value,
             "type": drive_state.config.type,
             "interval": drive_state.config.interval,
+            "effective_interval_sec": timing_state.effective_interval_sec if timing_state else drive_state.config.interval,
             "next_due_at": timing_state.next_due_at if timing_state else None,  # GUI expects next_due_at
             "next_due": timing_state.next_due_at if timing_state else None,  # Legacy compatibility
             "last_ok_at": drive_state.last_operation,  # GUI expects last_ok_at
@@ -2018,7 +1765,9 @@ class CoreEngine:
         # PHASE 3: Read from scheduler
         all_timing_states = self.scheduler.get_all_drive_states()
         needs_planning = any(
-            timing.enabled and timing.next_due_at is None
+            timing.enabled
+            and timing.next_due_at is None
+            and timing.status not in (DriveStatus.PAUSED, DriveStatus.QUARANTINE)
             for timing in all_timing_states.values()
         )
         
@@ -2265,14 +2014,14 @@ class CoreEngine:
             next_due_at = None
             if enabled and drive_state.status == DriveStatus.ACTIVE:
                 current_time = self.scheduler.clock.monotonic()
-                next_due_at = current_time + drive_state.config.interval
+                next_due_at = current_time + effective_interval
             
             # DUAL-WRITE Phase 2: Update old scheduler method
             self.scheduler.update_drive_state(
                 drive_letter=letter,
                 state=drive_state.status.value,
                 next_due_at=next_due_at,
-                interval_sec=drive_state.config.interval,  # Now contains effective value
+                interval_sec=drive_state.config.interval,  # User-configured interval
                 effective_interval_sec=effective_interval,
                 type=drive_state.config.type,
                 status_reason=status_reason
@@ -2282,7 +2031,7 @@ class CoreEngine:
             self.scheduler.set_drive_config(
                 drive_letter=letter,
                 enabled=enabled,
-                interval_sec=drive_state.config.interval,  # Use effective, not user's original
+                interval_sec=drive_state.config.interval,  # User-configured interval
                 drive_type=drive_type,
                 ping_dir=ping_dir
             )
@@ -2301,10 +2050,10 @@ class CoreEngine:
             else:
                 logger.debug(f"Drive {letter} config updated, preserving timing state")
             
-            # Update in-memory configuration with EFFECTIVE interval
+            # Update in-memory configuration with the user-configured interval
             if self.config_manager and letter in self.config.per_drive:
                 self.config.per_drive[letter].enabled = enabled
-                self.config.per_drive[letter].interval = drive_state.config.interval  # Use effective, not user's original
+                self.config.per_drive[letter].interval = drive_state.config.interval  # User-configured interval
                 self.config.per_drive[letter].type = drive_type
                 self.config.per_drive[letter].ping_dir = ping_dir
                 
@@ -2383,10 +2132,8 @@ class CoreEngine:
             self.config.per_drive.clear()
             logger.info("Cleared all existing drive configurations")
             
-            # Clear scheduler state
-            self.scheduler._drive_timing.clear()
-            self.scheduler._version = 0
-            self.scheduler._snapshot = None
+            # Clear scheduler state (thread-safe)
+            self.scheduler.clear_all()
             logger.info("Cleared scheduler state")
             
             # Clear scheduled operations
@@ -2424,7 +2171,13 @@ class CoreEngine:
         
         if not self.io_manager:
             return False
-        
+
+        # SAFE mode: simulate the ping and report success without touching the drive.
+        if self.io_manager.simulate_writes:
+            if self.logging_manager:
+                self.logging_manager.log_system_event("PING_NOW", f"User pinged {letter} (simulated, SAFE mode)")
+            return True
+
         try:
             # Resolve ping directory and file
             ping_dir = self.io_manager.get_ping_directory(letter, drive_state.config.ping_dir)

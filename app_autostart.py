@@ -4,6 +4,7 @@
 # Separated from app_config.py to maintain configuration purity.
 
 import subprocess
+import sys
 import tempfile
 import winreg
 from pathlib import Path
@@ -11,6 +12,19 @@ from typing import Tuple
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def get_exe_path() -> Path:
+    """Return the path autostart should point at.
+
+    In a frozen build this is the running executable (sys.executable); in dev
+    it is the sibling DriveRevenant.exe. Using sys.executable avoids pointing
+    autostart at PyInstaller's temp _MEI directory.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve()
+    return Path(__file__).resolve().parent / "DriveRevenant.exe"
+
 
 class AutostartManager:
     """Manages Windows autostart via Task Scheduler and Registry fallback."""
@@ -31,8 +45,10 @@ class AutostartManager:
     def _setup_task_scheduler(self) -> bool:
         """Set up autostart via Windows Task Scheduler."""
         try:
+            from xml.sax.saxutils import escape
             task_name = "DriveRevenant"
-            exe_path = str(self.exe_path)
+            # Escape the path so characters like '&' don't corrupt the XML.
+            exe_path = escape(str(self.exe_path))
 
             # Create XML for the task
             xml_content = f'''<?xml version="1.0" encoding="UTF-16"?>

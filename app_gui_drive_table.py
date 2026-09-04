@@ -622,7 +622,7 @@ class DriveTableWidget(QTableWidget):
         # The interval field now reflects the effective interval after caps/limits
 
         last_operation = drive_info.get('last_ok_at')  # Monotonic time of last operation
-        interval = drive_info.get('interval', 180)  # Actual interval being used (may be capped/limited)
+        interval = drive_info.get('effective_interval_sec', drive_info.get('interval', 180))  # Actual interval being used
         next_due_at = drive_info.get('next_due_at')  # Fallback if last_operation not available
         status_value = drive_info.get('status', 'Active')
         reason = drive_info.get('reason')

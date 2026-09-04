@@ -24,10 +24,11 @@ except ImportError:
     WINDOWS_AVAILABLE = False
 
 from app_config import ConfigManager, AppConfig
-from app_autostart import AutostartManager
+from app_autostart import AutostartManager, get_exe_path
 from app_core import CoreEngine
 from app_io import IOManager
 from app_logging import LoggingManager
+from app_version import __version__
 
 # Set up logger
 logger = logging.getLogger(__name__)
@@ -95,7 +96,7 @@ Examples:
     parser.add_argument(
         '--version',
         action='version',
-        version='Drive Revenant 2.3.0'
+        version=f'Drive Revenant {__version__}'
     )
     
     return parser.parse_args()
@@ -179,8 +180,8 @@ def initialize_application(args) -> Tuple[bool, Optional[AppConfig]]:
 def handle_autostart_fix():
     """Handle the --fix-autostart command."""
     try:
-        # Determine exe path (same as in old ConfigManager logic)
-        exe_path = Path(__file__).parent / "DriveRevenant.exe"
+        # Determine exe path (frozen exe or sibling dev exe)
+        exe_path = get_exe_path()
 
         autostart_manager = AutostartManager(exe_path)
 
@@ -256,8 +257,8 @@ def handle_config_info(args) -> bool:
 def check_autostart_integrity():
     """Check autostart integrity and log issues."""
     try:
-        # Determine exe path (same as in old ConfigManager logic)
-        exe_path = Path(__file__).parent / "DriveRevenant.exe"
+        # Determine exe path (frozen exe or sibling dev exe)
+        exe_path = get_exe_path()
         autostart_manager = AutostartManager(exe_path)
 
         is_valid, method, error = autostart_manager.verify_autostart()
@@ -500,7 +501,7 @@ def main():
 
         app = QApplication(sys.argv)
         app.setApplicationName("Drive Revenant")
-        app.setApplicationVersion("1.0.0")
+        app.setApplicationVersion(__version__)
         app.setOrganizationName("Drive Revenant")
         app.setStyle('Fusion')
         
